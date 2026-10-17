@@ -78,9 +78,12 @@ def is_admin(uid):
 
 def normalize_digits(text):
     text = str(text)
-    for i in range(10):
-        text = text.replace("۰۱۲۳۴۵۶۷۸۹"[i], str(i))
-        text = text.replace("٠١٢٤٥٦٧٨٩"[i], str(i))
+    # اعداد فارسی
+    text = text.replace("۰", "0").replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4")
+    text = text.replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9")
+    # اعداد عربی
+    text = text.replace("٠", "0").replace("١", "1").replace("٢", "2").replace("٣", "3").replace("٤", "4")
+    text = text.replace("٥", "5").replace("٦", "6").replace("٧", "7").replace("٨", "8").replace("٩", "9")
     return text
 
 def parse_amount(text):
