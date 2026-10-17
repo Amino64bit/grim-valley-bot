@@ -128,7 +128,6 @@ async def safe_delete(message):
         pass
 
 async def replace_message(query, context, text, markup=None, photo=None):
-    """پیام قبلی رو حذف می‌کنه و پیام جدید (با عکس در صورت وجود) می‌فرستد."""
     chat_id = query.message.chat_id
     await safe_delete(query.message)
     if photo:
@@ -243,7 +242,6 @@ async def buy_item(query, context, item_id):
                                   f"💵 نیاز داری: {item['buy_price']:,} $",
                                   back_main(), photo=item["image_url"])
             return
-        # تراکنش اتمیک: کم کردن پول و اضافه کردن آیتم در یک عملیات
         cur = conn.execute(
             "UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?",
             (item["buy_price"], uid, item["buy_price"])
@@ -290,85 +288,76 @@ async def give_daily(query, context):
     await replace_message(query, context, text, back_main())
 
 
-# ================= افزودن آیتم (مکالمه) =================
-ADD_PHOTO, ADD_NAME, ADD_BUY, ADD_SELL, ADD_CATEGORY = range(5)
-
+# ================= افزودن آیتم (ساده‌شده) =================
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        if update.callback_query:
-            await update.callback_query.answer("❌ فقط ادمین.", show_alert=True)
+        await update.message.reply_text("❌ فقط ادمین.")
         return ConversationHandler.END
-
-    context.user_data.pop("add", None)
-
-    if update.callback_query:
-        q = update.callback_query
-        await q.answer()
-        await replace_message(q, context, "📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
-        return ADD_PHOTO
-
-    msg = update.message
-    if msg.reply_to_message and msg.reply_to_message.photo:
-        context.user_data["add"] = {"image": msg.reply_to_message.photo[-1].file_id}
-        await msg.reply_text("✏️ اسم آیتم رو بنویس:")
-        return ADD_NAME
-
-    await msg.reply_text("📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
-    return ADD_PHOTO
+    
+    context.user_data.clear()
+    await update.message.reply_text("📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
+    return 1
 
 async def add_photo_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    context.user_data["add"] = {"image": update.message.photo[-1].file_id}
+    
+    if not update.message.photo:
+        await update.message.reply_text("❌ لطفاً فقط عکس بفرست.")
+        return 1
+    
+    context.user_data["image"] = update.message.photo[-1].file_id
     await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van")
-    return ADD_NAME
+    return 2
 
 async def add_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("add")
-    if not data:
-        await update.message.reply_text("❌ دوباره /additem بزن.")
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
     name = update.message.text.strip()
     if not name or len(name) > 60:
         await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
-        return ADD_NAME
-    data["name"] = name
-    await update.message.reply_text("💵 قیمت خرید رو فقط عدد بنویس (دلار):")
-    return ADD_BUY
+        return 2
+    
+    context.user_data["name"] = name
+    await update.message.reply_text("💵 قیمت خرید رو فقط عدد بنویس (دلار):\nمثال: 1500")
+    return 3
 
 async def add_buy_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("add")
-    if not data:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
     value = parse_amount(update.message.text)
     if value is None or value <= 0:
         await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
-        return ADD_BUY
-    data["buy"] = value
-    await update.message.reply_text("♻️ قیمت فروش/اسقاط رو فقط عدد بنویس (دلار):")
-    return ADD_SELL
+        return 3
+    
+    context.user_data["buy"] = value
+    await update.message.reply_text("♻️ قیمت فروش/اسقاط رو فقط عدد بنویس (دلار):\nمثال: 600")
+    return 4
 
 async def add_sell_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("add")
-    if not data:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
     value = parse_amount(update.message.text)
     if value is None or value < 0:
         await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
-        return ADD_SELL
-    data["sell"] = value
+        return 4
+    
+    context.user_data["sell"] = value
     await update.message.reply_text(
         "🏷️ دسته‌بندی رو بنویس (یکی از این سه تا):\n\n"
         "car  → خودرو\n"
         "resource  → منابع (طلا، الماس...)\n"
         "attachment  → باربند"
     )
-    return ADD_CATEGORY
+    return 5
 
 async def add_category_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("add")
-    if not data:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
     raw = update.message.text.strip().lower()
     mapping = {
         "car": "car", "خودرو": "car", "ماشین": "car",
@@ -378,16 +367,18 @@ async def add_category_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category = mapping.get(raw)
     if not category:
         await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
-        return ADD_CATEGORY
+        return 5
 
+    data = context.user_data
     with db() as conn:
         cur = conn.execute(
             "INSERT INTO items (name, category, buy_price, sell_price, image_url) VALUES (?,?,?,?,?)",
             (data["name"], category, data["buy"], data["sell"], data.get("image"))
         )
         new_id = cur.lastrowid
-    context.user_data.pop("add", None)
-
+    
+    context.user_data.clear()
+    
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
         [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
@@ -406,6 +397,11 @@ async def add_category_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(caption, reply_markup=markup)
     return ConversationHandler.END
 
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ لغو شد.\nمی‌تونی دوباره /additem بزنی.")
+    return ConversationHandler.END
+
 
 # ================= ویرایش آیتم (مکالمه) =================
 EDIT_PRICE, EDIT_NAME, EDIT_PHOTO = range(1, 4)
@@ -416,7 +412,7 @@ async def edit_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ فقط ادمین.", show_alert=True)
         return ConversationHandler.END
     await q.answer()
-    parts = q.data.split("_")          # eb_3  /  es_3
+    parts = q.data.split("_")
     field = "buy_price" if parts[0] == "eb" else "sell_price"
     context.user_data["edit"] = {"id": int(parts[1]), "field": field}
     label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
@@ -481,13 +477,6 @@ async def edit_photo_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE items SET image_url=? WHERE id=?", (file_id, state["id"]))
     context.user_data.pop("edit", None)
     await update.message.reply_text("✅ عکس جایگزین شد.")
-    return ConversationHandler.END
-
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("add", None)
-    context.user_data.pop("edit", None)
-    if update.effective_message:
-        await update.effective_message.reply_text("❌ لغو شد.")
     return ConversationHandler.END
 
 
@@ -591,7 +580,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         ensure_player(conn, target, target_name)
 
-        # خانه
         if low in ("+house", "+خونه", "+خانه"):
             conn.execute("UPDATE players SET has_house=1 WHERE user_id=?", (target,))
             await msg.reply_text("✅ خانه ثبت شد.")
@@ -601,7 +589,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("✅ خانه حذف شد.")
             return
 
-        # تعمیر
         if low in ("repair", "تعمیر", "+repair"):
             player = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()
             if player["cash"] < REPAIR_COST:
@@ -611,11 +598,9 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"🔧 هزینه تعمیر: {REPAIR_COST} $ کم شد.")
             return
 
-        # اضافه کردن ماشین
         if low.startswith("+car ") or low.startswith("+ماشین "):
             name = text.split(" ", 1)[1].strip()
-            player = conn.execute("SELECT cars FROM players WHERE user_id=?", (target,)).fetchone()
-            row = conn.execute("SELECT * FROM players WHERE user_id=?", (target,)).fetchone()
+            row = conn.execute("SELECT cars FROM players WHERE user_id=?", (target,)).fetchone()
             cars = get_cars(row)
             if len(cars) >= MAX_CARS:
                 await msg.reply_text(f"❌ سقف {MAX_CARS} ماشین پر شده!")
@@ -625,7 +610,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"✅ {name} اضافه شد. ({len(cars)}/{MAX_CARS})")
             return
 
-        # کم کردن ماشین (با اسم یا بدون اسم = آخرین ماشین)
         if low.startswith("-car") or low.startswith("-ماشین"):
             parts = text.split(" ", 1)
             name = parts[1].strip() if len(parts) > 1 else ""
@@ -647,7 +631,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"✅ {removed} حذف شد. ({len(cars)}/{MAX_CARS} باقی‌مانده)")
             return
 
-        # پول
         if len(text) >= 2 and text[0] in "+-":
             amount = parse_amount(text[1:])
             if amount is None or amount <= 0:
@@ -708,7 +691,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ فایل باید پسوند .db داشته باشه.")
         return
     if doc.file_size > 20 * 1024 * 1024:
-        await msg.reply_text("❌ فایل-too-large")
+        await msg.reply_text("❌ فایل خیلی حجیمه.")
         return
 
     tmp = "restore_tmp.db"
@@ -740,43 +723,32 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "main_menu":
         await replace_message(q, context, "🎮 تریدر | منوی اصلی", main_menu())
-
     elif data == "my_assets":
         await show_assets(q, context)
-
     elif data == "shop":
         await show_shop(q, context)
-
     elif data == "leaderboard":
         await show_leaderboard(q, context)
-
     elif data == "daily":
         await give_daily(q, context)
-
     elif data.startswith("cat_"):
         await show_category(q, context, data[4:])
-
     elif data.startswith("buy_"):
         raw = data[4:]
         if raw.isdigit():
             await buy_item(q, context, int(raw))
-
     elif data == "admin_backup":
         if is_admin(uid):
             await send_backup(q.message.chat_id, context)
-
     elif data == "admin_list":
         if is_admin(uid):
             await show_admin_list(q, context)
-
     elif data.startswith("item_"):
         if is_admin(uid) and data[5:].isdigit():
             await show_item_detail(q, context, int(data[5:]))
-
     elif data.startswith("delyes_"):
         if is_admin(uid) and data[7:].isdigit():
             await do_delete(q, context, int(data[7:]))
-
     elif data.startswith("del_"):
         if is_admin(uid) and data[4:].isdigit():
             await confirm_delete(q, context, int(data[4:]))
@@ -803,11 +775,11 @@ def main():
             CallbackQueryHandler(add_start, pattern=r"^admin_add$"),
         ],
         states={
-            ADD_PHOTO: [MessageHandler(filters.PHOTO, add_photo_step)],
-            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_step)],
-            ADD_BUY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_buy_step)],
-            ADD_SELL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_sell_step)],
-            ADD_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_category_step)],
+            1: [MessageHandler(filters.PHOTO, add_photo_step)],
+            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_step)],
+            3: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_buy_step)],
+            4: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_sell_step)],
+            5: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_category_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conv)],
         name="add_item_conv",
@@ -830,7 +802,6 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # ترتیب مهم است: مکالمه‌ها قبل از دیسپچر عمومی
     application.add_handler(add_conv)
     application.add_handler(edit_conv)
     application.add_handler(CommandHandler("start", start))
