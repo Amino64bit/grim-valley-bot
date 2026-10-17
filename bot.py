@@ -139,15 +139,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid = update.effective_user.id
-name = update.effective_user.username or update.effective_user.first_name or "پلیر"
-with db() as conn:
+    name = update.effective_user.username or update.effective_user.first_name or "پلیر"
+    with db() as conn:
         ensure_player(conn, uid, name)
         conn.execute("UPDATE players SET username=? WHERE user_id=?", (name, uid))
     await update.message.reply_text(
         f"🎮 به تریدر (Trader) خوش آمدی {name}!\n\nاز منوی زیر استفاده کن:",
         reply_markup=main_menu()
     )
-
 def asset_text(conn, player):
     cars = get_cars(player)
     car_value = 0
