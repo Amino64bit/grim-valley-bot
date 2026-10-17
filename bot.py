@@ -78,10 +78,8 @@ def is_admin(uid):
 
 def normalize_digits(text):
     text = str(text)
-    # اعداد فارسی
     text = text.replace("۰", "0").replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4")
     text = text.replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9")
-    # اعداد عربی
     text = text.replace("٠", "0").replace("١", "1").replace("٢", "2").replace("٣", "3").replace("٤", "4")
     text = text.replace("٥", "5").replace("٦", "6").replace("٧", "7").replace("٨", "8").replace("٩", "9")
     return text
@@ -282,157 +280,144 @@ async def give_daily(query, context):
     await replace_message(query, context, text, back_main())
 
 
-# ================= افزودن آیتم (فقط متن) =================
+# ================= افزودن آیتم (ساده) =================
 async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط ادمین.")
         return
     
     context.user_data.clear()
-    context.user_data["mode"] = "add"
-    context.user_data["add_state"] = "waiting_name"
-    await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
+    context.user_data["step"] = 1
+    await update.message.reply_text("✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
 
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     
-    if not update.message or not update.message.text:
-        return
-    
-    mode = context.user_data.get("mode")
-    if not mode:
+    step = context.user_data.get("step")
+    if not step:
         return
     
     text = update.message.text.strip()
-    if not text:
-        return
     
     try:
-        if mode == "add":
-            await process_add(update, context, text)
-        elif mode == "edit":
-            await process_edit(update, context, text)
+        if step == 1:
+            if not text or len(text) > 60:
+                await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
+                return
+            context.user_data["item_name"] = text
+            context.user_data["step"] = 2
+            await update.message.reply_text("✏️ مرحله ۲ از ۴:\nقیمت خرید رو فقط عدد بنویس:\nمثال: 1500")
+        
+        elif step == 2:
+            value = parse_amount(text)
+            if value is None or value <= 0:
+                await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
+                return
+            context.user_data["item_buy"] = value
+            context.user_data["step"] = 3
+            await update.message.reply_text("✏️ مرحله ۳ از ۴:\nقیمت فروش رو فقط عدد بنویس:\nمثال: 600")
+        
+        elif step == 3:
+            value = parse_amount(text)
+            if value is None or value < 0:
+                await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
+                return
+            context.user_data["item_sell"] = value
+            context.user_data["step"] = 4
+            await update.message.reply_text(
+                "✏️ مرحله ۴ از ۴:\nدسته‌بندی رو بنویس:\n\n"
+                "car → خودرو\n"
+                "resource → منابع\n"
+                "attachment → باربند"
+            )
+        
+        elif step == 4:
+            raw = text.lower()
+            mapping = {
+                "car": "car", "خودرو": "car", "ماشین": "car",
+                "resource": "resource", "منبع": "resource", "منابع": "resource",
+                "attachment": "attachment", "باربند": "attachment",
+            }
+            category = mapping.get(raw)
+            if not category:
+                await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
+                return
+            
+            name = context.user_data.get("item_name")
+            buy = context.user_data.get("item_buy")
+            sell = context.user_data.get("item_sell")
+            
+            if not name or not buy or not sell:
+                await update.message.reply_text("❌ اطلاعات ناقصه. دوباره /additem بزن.")
+                return
+            
+            with db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)",
+                    (name, category, buy, sell)
+                )
+                new_id = cur.lastrowid
+            
+            context.user_data.clear()
+            
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
+                [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
+            ])
+            caption = (
+                f"✅ آیتم ثبت شد!\n\n"
+                f"🆔 کد: {new_id}\n"
+                f"📛 اسم: {name}\n"
+                f"🏷️ دسته: {CATEGORIES[category]}\n"
+                f"💵 خرید: {buy:,} $\n"
+                f"♻️ فروش: {sell:,} $"
+            )
+            await update.message.reply_text(caption, reply_markup=markup)
+    
     except Exception as e:
-        logger.error(f"Error in handle_text_input: {e}", exc_info=True)
+        logger.error(f"Error in handle_text_for_add: {e}", exc_info=True)
         await update.message.reply_text(f"⚠️ خطا: {str(e)}")
 
-async def process_add(update, context, text):
-    data = context.user_data
-    state = data.get("add_state")
-    
-    # چک کنیم که داده‌های قبلی وجود دارن
-    if state == "waiting_buy" and "name" not in data:
-        data["add_state"] = "waiting_name"
-        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
-        return
-    
-    if state == "waiting_sell" and ("name" not in data or "buy" not in data):
-        data["add_state"] = "waiting_name"
-        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
-        return
-    
-    if state == "waiting_category" and ("name" not in data or "buy" not in data or "sell" not in data):
-        data["add_state"] = "waiting_name"
-        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
-        return
-    
-    if state == "waiting_name":
-        if not text or len(text) > 60:
-            await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
-            return
-        data["name"] = text
-        data["add_state"] = "waiting_buy"
-        await update.message.reply_text("💵 قیمت خرید رو فقط عدد بنویس:\nمثال: 1500")
-    
-    elif state == "waiting_buy":
-        value = parse_amount(text)
-        if value is None or value <= 0:
-            await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
-            return
-        data["buy"] = value
-        data["add_state"] = "waiting_sell"
-        await update.message.reply_text("♻️ قیمت فروش رو فقط عدد بنویس:\nمثال: 600")
-    
-    elif state == "waiting_sell":
-        value = parse_amount(text)
-        if value is None or value < 0:
-            await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
-            return
-        data["sell"] = value
-        data["add_state"] = "waiting_category"
-        await update.message.reply_text(
-            "🏷️ دسته‌بندی رو بنویس:\n\n"
-            "car → خودرو\n"
-            "resource → منابع\n"
-            "attachment → باربند"
-        )
-    
-    elif state == "waiting_category":
-        raw = text.lower()
-        mapping = {
-            "car": "car", "خودرو": "car", "ماشین": "car",
-            "resource": "resource", "منبع": "resource", "منابع": "resource",
-            "attachment": "attachment", "باربند": "attachment",
-        }
-        category = mapping.get(raw)
-        if not category:
-            await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
-            return
-        
-        # چک نهایی قبل از ذخیره
-        if "name" not in data or "buy" not in data or "sell" not in data:
-            await update.message.reply_text("❌ اطلاعات ناقصه. دوباره /additem بزن.")
-            return
-        
-        with db() as conn:
-            cur = conn.execute(
-                "INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)",
-                (data["name"], category, data["buy"], data["sell"])
-            )
-            new_id = cur.lastrowid
-        
-        context.user_data.clear()
-        
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
-            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
-        ])
-        caption = (
-            f"✅ آیتم ثبت شد!\n\n"
-            f"🆔 کد: {new_id}\n"
-            f"📛 اسم: {data['name']}\n"
-            f"🏷️ دسته: {CATEGORIES[category]}\n"
-            f"💵 خرید: {data['buy']:,} $\n"
-            f"♻️ فروش: {data['sell']:,} $"
-        )
-        await update.message.reply_text(caption, reply_markup=markup)
 
-async def process_edit(update, context, text):
-    data = context.user_data
-    state = data.get("edit_state")
-    edit_data = data.get("edit_data", {})
+# ================= ویرایش آیتم =================
+async def handle_text_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     
-    if state == "edit_price":
-        value = parse_amount(text)
-        if value is None or value < 0:
-            await update.message.reply_text("❌ یه عدد معتبر بنویس.")
-            return
-        field = edit_data["field"]
-        with db() as conn:
-            conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, edit_data["id"]))
-        context.user_data.clear()
-        label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
-        await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
+    edit_step = context.user_data.get("edit_step")
+    if not edit_step:
+        return
     
-    elif state == "edit_name":
-        if not text or len(text) > 60:
-            await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
-            return
-        with db() as conn:
-            conn.execute("UPDATE items SET name=? WHERE id=?", (text, edit_data["id"]))
-        context.user_data.clear()
-        await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
+    text = update.message.text.strip()
+    
+    try:
+        if edit_step == "edit_price":
+            value = parse_amount(text)
+            if value is None or value < 0:
+                await update.message.reply_text("❌ یه عدد معتبر بنویس.")
+                return
+            field = context.user_data.get("edit_field")
+            item_id = context.user_data.get("edit_id")
+            with db() as conn:
+                conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
+            context.user_data.clear()
+            label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
+            await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
+        
+        elif edit_step == "edit_name":
+            if not text or len(text) > 60:
+                await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
+                return
+            item_id = context.user_data.get("edit_id")
+            with db() as conn:
+                conn.execute("UPDATE items SET name=? WHERE id=?", (text, item_id))
+            context.user_data.clear()
+            await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
+    
+    except Exception as e:
+        logger.error(f"Error in handle_text_for_edit: {e}", exc_info=True)
+        await update.message.reply_text(f"⚠️ خطا: {str(e)}")
 
 
 # ================= پنل ادمین: لیست / جزئیات / حذف =================
@@ -707,9 +692,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_add":
         if is_admin(uid):
             context.user_data.clear()
-            context.user_data["mode"] = "add"
-            context.user_data["add_state"] = "waiting_name"
-            await replace_message(q, context, "✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
+            context.user_data["step"] = 1
+            await replace_message(q, context, "✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
     elif data.startswith("item_"):
         if is_admin(uid) and data[5:].isdigit():
             await show_item_detail(q, context, int(data[5:]))
@@ -723,25 +707,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(uid):
             parts = data.split("_")
             context.user_data.clear()
-            context.user_data["mode"] = "edit"
-            context.user_data["edit_state"] = "edit_price"
-            context.user_data["edit_data"] = {"id": int(parts[1]), "field": "buy_price"}
+            context.user_data["edit_step"] = "edit_price"
+            context.user_data["edit_field"] = "buy_price"
+            context.user_data["edit_id"] = int(parts[1])
             await replace_message(q, context, "💵 قیمت خرید جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
     elif data.startswith("es_"):
         if is_admin(uid):
             parts = data.split("_")
             context.user_data.clear()
-            context.user_data["mode"] = "edit"
-            context.user_data["edit_state"] = "edit_price"
-            context.user_data["edit_data"] = {"id": int(parts[1]), "field": "sell_price"}
+            context.user_data["edit_step"] = "edit_price"
+            context.user_data["edit_field"] = "sell_price"
+            context.user_data["edit_id"] = int(parts[1])
             await replace_message(q, context, "💵 قیمت فروش جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
     elif data.startswith("en_"):
         if is_admin(uid):
             parts = data.split("_")
             context.user_data.clear()
-            context.user_data["mode"] = "edit"
-            context.user_data["edit_state"] = "edit_name"
-            context.user_data["edit_data"] = {"id": int(parts[1])}
+            context.user_data["edit_step"] = "edit_name"
+            context.user_data["edit_id"] = int(parts[1])
             await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
 
 
@@ -773,7 +756,8 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel))
     
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_add))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_edit))
     
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_error_handler(on_error)
