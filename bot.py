@@ -68,8 +68,7 @@ def init_db():
             name TEXT NOT NULL,
             category TEXT NOT NULL,
             buy_price INTEGER NOT NULL,
-            sell_price INTEGER NOT NULL,
-            image_url TEXT
+            sell_price INTEGER NOT NULL
         )""")
 
 
@@ -125,15 +124,9 @@ async def safe_delete(message):
     except TelegramError:
         pass
 
-async def replace_message(query, context, text, markup=None, photo=None):
+async def replace_message(query, context, text, markup=None):
     chat_id = query.message.chat_id
     await safe_delete(query.message)
-    if photo:
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=text, reply_markup=markup)
-            return
-        except TelegramError:
-            pass
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
@@ -230,13 +223,13 @@ async def buy_item(query, context, item_id):
         if item["category"] == "car" and len(cars) >= MAX_CARS:
             await replace_message(query, context,
                                   f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.",
-                                  back_main(), photo=item["image_url"])
+                                  back_main())
             return
         if player["cash"] < item["buy_price"]:
             await replace_message(query, context,
                                   f"❌ پولت کمه!\n💰 داری: {player['cash']:,} $\n"
                                   f"💵 نیاز داری: {item['buy_price']:,} $",
-                                  back_main(), photo=item["image_url"])
+                                  back_main())
             return
         cur = conn.execute(
             "UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?",
@@ -252,7 +245,7 @@ async def buy_item(query, context, item_id):
         query, context,
         f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n"
         f"📦 برای تحویل گرفتن به ادمین سرور پیام بده.",
-        back_main(), photo=item["image_url"]
+        back_main()
     )
 
 async def show_leaderboard(query, context):
@@ -284,27 +277,15 @@ async def give_daily(query, context):
     await replace_message(query, context, text, back_main())
 
 
-# ================= افزودن آیتم (بدون ConversationHandler) =================
+# ================= افزودن آیتم (فقط متن) =================
 async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط ادمین.")
         return
     
     context.user_data.clear()
-    context.user_data["add_state"] = "waiting_photo"
-    await update.message.reply_text("📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    
-    state = context.user_data.get("add_state")
-    if state != "waiting_photo":
-        return
-    
-    context.user_data["image"] = update.message.photo[-1].file_id
     context.user_data["add_state"] = "waiting_name"
-    await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van")
+    await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
 
 async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -362,8 +343,8 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         with db() as conn:
             cur = conn.execute(
-                "INSERT INTO items (name, category, buy_price, sell_price, image_url) VALUES (?,?,?,?,?)",
-                (data["name"], category, data["buy"], data["sell"], data.get("image"))
+                "INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)",
+                (data["name"], category, data["buy"], data["sell"])
             )
             new_id = cur.lastrowid
         
@@ -381,13 +362,10 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"💵 خرید: {data['buy']:,} $\n"
             f"♻️ فروش: {data['sell']:,} $"
         )
-        if data.get("image"):
-            await update.message.reply_photo(photo=data["image"], caption=caption, reply_markup=markup)
-        else:
-            await update.message.reply_text(caption, reply_markup=markup)
+        await update.message.reply_text(caption, reply_markup=markup)
 
 
-# ================= ویرایش آیتم (بدون ConversationHandler) =================
+# ================= ویرایش آیتم (فقط متن) =================
 async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -421,22 +399,6 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("edit_state", None)
         context.user_data.pop("edit_data", None)
         await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
-
-async def handle_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    
-    edit_state = context.user_data.get("edit_state")
-    if edit_state != "edit_photo":
-        return
-    
-    data = context.user_data.get("edit_data", {})
-    file_id = update.message.photo[-1].file_id
-    with db() as conn:
-        conn.execute("UPDATE items SET image_url=? WHERE id=?", (file_id, data["id"]))
-    context.user_data.pop("edit_state", None)
-    context.user_data.pop("edit_data", None)
-    await update.message.reply_text("✅ عکس جایگزین شد.")
 
 
 # ================= پنل ادمین: لیست / جزئیات / حذف =================
@@ -490,13 +452,12 @@ async def show_item_detail(query, context, item_id):
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ قیمت خرید", callback_data="eb_" + str(it["id"])),
          InlineKeyboardButton("✏️ قیمت فروش", callback_data="es_" + str(it["id"]))],
-        [InlineKeyboardButton("✏️ اسم", callback_data="en_" + str(it["id"])),
-         InlineKeyboardButton("🖼️ عوض کردن عکس", callback_data="ep_" + str(it["id"]))],
+        [InlineKeyboardButton("✏️ اسم", callback_data="en_" + str(it["id"]))],
         [InlineKeyboardButton("🗑️ حذف آیتم", callback_data="del_" + str(it["id"]))],
         [InlineKeyboardButton("📋 لیست", callback_data="admin_list"),
          InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
     ])
-    await replace_message(query, context, text, markup, photo=it["image_url"])
+    await replace_message(query, context, text, markup)
 
 async def confirm_delete(query, context, item_id):
     with db() as conn:
@@ -710,8 +671,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_add":
         if is_admin(uid):
             context.user_data.clear()
-            context.user_data["add_state"] = "waiting_photo"
-            await replace_message(q, context, "📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
+            context.user_data["add_state"] = "waiting_name"
+            await replace_message(q, context, "✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
     elif data.startswith("item_"):
         if is_admin(uid) and data[5:].isdigit():
             await show_item_detail(q, context, int(data[5:]))
@@ -739,12 +700,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["edit_state"] = "edit_name"
             context.user_data["edit_data"] = {"id": int(parts[1])}
             await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
-    elif data.startswith("ep_"):
-        if is_admin(uid):
-            parts = data.split("_")
-            context.user_data["edit_state"] = "edit_photo"
-            context.user_data["edit_data"] = {"id": int(parts[1])}
-            await replace_message(q, context, "📸 عکس جدید رو بفرست:\n(لغو با /cancel)")
 
 
 # ================= خطاها =================
@@ -773,8 +728,6 @@ def main():
     application.add_handler(CommandHandler("restore", restore_backup))
     application.add_handler(CommandHandler("cancel", cancel))
     
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_edit_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_add))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
