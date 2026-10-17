@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # ================= تنظیمات =================
 BOT_TOKEN = "8725147253:AAEV-vZc1bNzS-Gk4HYDGLpQtdQagsvtEdg"
 ADMIN_ID = 5591238725
-ADMIN_ID_2 = 6270844351
+ADMIN_ID_2 = 6270844351  # <<< آیدی عددی ادمین دوم را اینجا وارد کنید
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
 HOUSE_VALUE = 2500
@@ -147,6 +147,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎮 به تریدر (Trader) خوش آمدی {name}!\n\nاز منوی زیر استفاده کن:",
         reply_markup=main_menu()
     )
+
 def asset_text(conn, player):
     cars = get_cars(player)
     car_value = 0
@@ -231,7 +232,10 @@ async def buy_item(query, context, item_id):
         if player["cash"] < item["buy_price"]:
             await replace_message(query, context, f"❌ پولت کمه!\n💰 داری: {player['cash']:,} $\n💵 نیاز داری: {item['buy_price']:,} $", back_main())
             return
-        cur = conn.execute("UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?", (item["buy_price"], uid, item["buy_price"]))
+        cur = conn.execute(
+            "UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?",
+            (item["buy_price"], uid, item["buy_price"])
+        )
         if cur.rowcount != 1:
             await replace_message(query, context, "❌ موجودی کافی نیست.", back_main())
             return
@@ -241,7 +245,7 @@ async def buy_item(query, context, item_id):
     
     admin_msg = (
         f"🛒 **سفارش جدید!**\n\n"
-        f" پلیر: {username}\n"
+        f"👤 پلیر: {username}\n"
         f"🆔 آیدی: `{uid}`\n"
         f"📦 آیتم: {item['name']}\n"
         f"🏷️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
@@ -261,7 +265,7 @@ async def buy_item(query, context, item_id):
 
     await replace_message(
         query, context,
-        f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n برای تحویل گرفتن به ادمین سرور پیام بده.",
+        f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n📦 برای تحویل گرفتن به ادمین سرور پیام بده.",
         back_main()
     )
 
@@ -294,12 +298,11 @@ async def give_daily(query, context):
     await replace_message(query, context, text, back_main())
 
 
-# ================= افزودن آیتم (ساده) =================
+# ================= افزودن آیتم =================
 async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط ادمین.")
         return
-    
     context.user_data.clear()
     context.user_data["step"] = 1
     await update.message.reply_text("✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
@@ -307,13 +310,10 @@ async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    
     step = context.user_data.get("step")
     if not step:
         return
-    
     text = update.message.text.strip()
-    
     try:
         if step == 1:
             if not text or len(text) > 60:
@@ -322,7 +322,6 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["item_name"] = text
             context.user_data["step"] = 2
             await update.message.reply_text("✏️ مرحله ۲ از ۴:\nقیمت خرید رو فقط عدد بنویس:\nمثال: 1500")
-        
         elif step == 2:
             value = parse_amount(text)
             if value is None or value <= 0:
@@ -331,7 +330,6 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["item_buy"] = value
             context.user_data["step"] = 3
             await update.message.reply_text("✏️ مرحله ۳ از ۴:\nقیمت فروش رو فقط عدد بنویس:\nمثال: 600")
-        
         elif step == 3:
             value = parse_amount(text)
             if value is None or value < 0:
@@ -339,20 +337,10 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             context.user_data["item_sell"] = value
             context.user_data["step"] = 4
-            await update.message.reply_text(
-                "✏️ مرحله ۴ از ۴:\nدسته‌بندی رو بنویس:\n\n"
-                "car → خودرو\n"
-                "resource → منابع\n"
-                "attachment → باربند"
-            )
-        
+            await update.message.reply_text("✏️ مرحله ۴ از ۴:\nدسته‌بندی رو بنویس:\n\ncar → خودرو\nresource → منابع\nattachment → باربند")
         elif step == 4:
             raw = text.lower()
-            mapping = {
-                "car": "car", "خودرو": "car", "ماشین": "car",
-                "resource": "resource", "منبع": "resource", "منابع": "resource",
-                "attachment": "attachment", "باربند": "attachment",
-            }
+            mapping = {"car": "car", "خودرو": "car", "ماشین": "car", "resource": "resource", "منبع": "resource", "منابع": "resource", "attachment": "attachment", "باربند": "attachment"}
             category = mapping.get(raw)
             if not category:
                 await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
@@ -362,33 +350,17 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
             buy = context.user_data.get("item_buy")
             sell = context.user_data.get("item_sell")
             
-            if not name or not buy or not sell:
-                await update.message.reply_text("❌ اطلاعات ناقصه. دوباره /additem بزن.")
-                return
-            
             with db() as conn:
-                cur = conn.execute(
-                    "INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)",
-                    (name, category, buy, sell)
-                )
+                cur = conn.execute("INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)", (name, category, buy, sell))
                 new_id = cur.lastrowid
             
             context.user_data.clear()
-            
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
                 [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
             ])
-            caption = (
-                f"✅ آیتم ثبت شد!\n\n"
-                f"🆔 کد: {new_id}\n"
-                f"📛 اسم: {name}\n"
-                f"🏷️ دسته: {CATEGORIES[category]}\n"
-                f"💵 خرید: {buy:,} $\n"
-                f"♻️ فروش: {sell:,} $"
-            )
+            caption = f"✅ آیتم ثبت شد!\n\n🆔 کد: {new_id}\n📛 اسم: {name}\n🏷️ دسته: {CATEGORIES[category]}\n💵 خرید: {buy:,} $\n♻️ فروش: {sell:,} $"
             await update.message.reply_text(caption, reply_markup=markup)
-    
     except Exception as e:
         logger.error(f"Error in handle_text_for_add: {e}", exc_info=True)
         await update.message.reply_text(f"⚠️ خطا: {str(e)}")
@@ -398,13 +370,10 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_text_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    
     edit_step = context.user_data.get("edit_step")
     if not edit_step:
         return
-    
     text = update.message.text.strip()
-    
     try:
         if edit_step == "edit_price":
             value = parse_amount(text)
@@ -418,7 +387,6 @@ async def handle_text_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data.clear()
             label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
             await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
-        
         elif edit_step == "edit_name":
             if not text or len(text) > 60:
                 await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
@@ -428,7 +396,6 @@ async def handle_text_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
                 conn.execute("UPDATE items SET name=? WHERE id=?", (text, item_id))
             context.user_data.clear()
             await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
-    
     except Exception as e:
         logger.error(f"Error in handle_text_for_edit: {e}", exc_info=True)
         await update.message.reply_text(f"⚠️ خطا: {str(e)}")
@@ -502,8 +469,7 @@ async def confirm_delete(query, context, item_id):
         [InlineKeyboardButton("✅ بله، حذف کن", callback_data="delyes_" + str(item_id)),
          InlineKeyboardButton("❌ نه", callback_data="item_" + str(item_id))],
     ])
-    await replace_message(query, context,
-                          f"⚠️ مطمئنی «{it['name']}» حذف بشه؟\nاین کار برگشت‌پذیر نیست.", markup)
+    await replace_message(query, context, f"⚠️ مطمئنی «{it['name']}» حذف بشه؟\nاین کار برگشت‌پذیر نیست.", markup)
 
 async def do_delete(query, context, item_id):
     with db() as conn:
@@ -525,7 +491,7 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.reply_to_message or not msg.text:
         return
     target = msg.reply_to_message.from_user.id
-    target_name = msg.reply_to_message.from_user.username or "player"
+    target_name = msg.reply_to_message.from_user.username or msg.reply_to_message.from_user.first_name or "player"
     text = msg.text.strip()
     if not text:
         return
@@ -533,7 +499,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with db() as conn:
         ensure_player(conn, target, target_name)
-
         if low in ("+house", "+خونه", "+خانه"):
             conn.execute("UPDATE players SET has_house=1 WHERE user_id=?", (target,))
             await msg.reply_text("✅ خانه ثبت شد.")
@@ -542,7 +507,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE players SET has_house=0 WHERE user_id=?", (target,))
             await msg.reply_text("✅ خانه حذف شد.")
             return
-
         if low in ("repair", "تعمیر", "+repair"):
             player = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()
             if player["cash"] < REPAIR_COST:
@@ -551,7 +515,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (REPAIR_COST, target))
             await msg.reply_text(f"🔧 هزینه تعمیر: {REPAIR_COST} $ کم شد.")
             return
-
         if low.startswith("+car ") or low.startswith("+ماشین "):
             name = text.split(" ", 1)[1].strip()
             row = conn.execute("SELECT cars FROM players WHERE user_id=?", (target,)).fetchone()
@@ -563,7 +526,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), target))
             await msg.reply_text(f"✅ {name} اضافه شد. ({len(cars)}/{MAX_CARS})")
             return
-
         if low.startswith("-car") or low.startswith("-ماشین"):
             parts = text.split(" ", 1)
             name = parts[1].strip() if len(parts) > 1 else ""
@@ -575,8 +537,7 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if name:
                 found = next((i for i, c in enumerate(cars) if c.lower() == name.lower()), None)
                 if found is None:
-                    await msg.reply_text("❌ این ماشین توی لیستش نیست.\nلیستش:\n" +
-                                          "\n".join(f"• {c}" for c in cars))
+                    await msg.reply_text("❌ این ماشین توی لیستش نیست.\nلیستش:\n" + "\n".join(f"• {c}" for c in cars))
                     return
                 removed = cars.pop(found)
             else:
@@ -584,7 +545,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), target))
             await msg.reply_text(f"✅ {removed} حذف شد. ({len(cars)}/{MAX_CARS} باقی‌مانده)")
             return
-
         if len(text) >= 2 and text[0] in "+-":
             amount = parse_amount(text[1:])
             if amount is None or amount <= 0:
@@ -647,7 +607,6 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.file_size > 20 * 1024 * 1024:
         await msg.reply_text("❌ فایل خیلی حجیمه.")
         return
-
     tmp = "restore_tmp.db"
     try:
         tg_file = await context.bot.get_file(doc.file_id)
@@ -696,7 +655,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("buy_"):
         raw = data[4:]
         if raw.isdigit():
-            await (q, context, int(raw))
+            await buy_item(q, context, int(raw))
     elif data == "admin_backup":
         if is_admin(uid):
             await send_backup(q.message.chat_id, context)
