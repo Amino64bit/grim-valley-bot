@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # ================= تنظیمات =================
 BOT_TOKEN = "8725147253:AAEV-vZc1bNzS-Gk4HYDGLpQtdQagsvtEdg"
 ADMIN_ID = 5591238725
+ADMIN_ID_2 = 6270844351
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
 HOUSE_VALUE = 2500
@@ -74,7 +75,7 @@ def init_db():
 
 # ================= ابزارها =================
 def is_admin(uid):
-    return uid == ADMIN_ID
+    return uid == ADMIN_ID or uid == ADMIN_ID_2
 
 def normalize_digits(text):
     text = str(text)
@@ -258,6 +259,7 @@ async def buy_item(query, context, item_id):
         f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     
+        # ارسال به ادمین اول
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -266,6 +268,16 @@ async def buy_item(query, context, item_id):
         )
     except Exception as e:
         logger.error(f"Failed to send admin notification: {e}")
+    
+    # ارسال به ادمین دوم
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID_2,
+            text=admin_msg,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send admin notification to second admin: {e}")
     
     await replace_message(
         query, context,
