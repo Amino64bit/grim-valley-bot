@@ -11,10 +11,7 @@ from datetime import datetime, timezone
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,6 +49,7 @@ def db():
     try:
         with conn:
             yield conn
+        conn.commit()
     finally:
         conn.close()
 
@@ -132,9 +130,7 @@ async def replace_message(query, context, text, markup=None, photo=None):
     await safe_delete(query.message)
     if photo:
         try:
-            await context.bot.send_photo(
-                chat_id=chat_id, photo=photo, caption=text, reply_markup=markup
-            )
+            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=text, reply_markup=markup)
             return
         except TelegramError:
             pass
@@ -288,196 +284,159 @@ async def give_daily(query, context):
     await replace_message(query, context, text, back_main())
 
 
-# ================= افزودن آیتم (ساده‌شده) =================
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= افزودن آیتم (بدون ConversationHandler) =================
+async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط ادمین.")
-        return ConversationHandler.END
+        return
     
     context.user_data.clear()
+    context.user_data["add_state"] = "waiting_photo"
     await update.message.reply_text("📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
-    return 1
 
-async def add_photo_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
+        return
     
-    if not update.message.photo:
-        await update.message.reply_text("❌ لطفاً فقط عکس بفرست.")
-        return 1
+    state = context.user_data.get("add_state")
+    if state != "waiting_photo":
+        return
     
     context.user_data["image"] = update.message.photo[-1].file_id
+    context.user_data["add_state"] = "waiting_name"
     await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van")
-    return 2
 
-async def add_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
+        return
     
-    name = update.message.text.strip()
-    if not name or len(name) > 60:
-        await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
-        return 2
+    state = context.user_data.get("add_state")
+    if not state:
+        return
     
-    context.user_data["name"] = name
-    await update.message.reply_text("💵 قیمت خرید رو فقط عدد بنویس (دلار):\nمثال: 1500")
-    return 3
-
-async def add_buy_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    
-    value = parse_amount(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
-        return 3
-    
-    context.user_data["buy"] = value
-    await update.message.reply_text("♻️ قیمت فروش/اسقاط رو فقط عدد بنویس (دلار):\nمثال: 600")
-    return 4
-
-async def add_sell_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    
-    value = parse_amount(update.message.text)
-    if value is None or value < 0:
-        await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
-        return 4
-    
-    context.user_data["sell"] = value
-    await update.message.reply_text(
-        "🏷️ دسته‌بندی رو بنویس (یکی از این سه تا):\n\n"
-        "car  → خودرو\n"
-        "resource  → منابع (طلا، الماس...)\n"
-        "attachment  → باربند"
-    )
-    return 5
-
-async def add_category_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    
-    raw = update.message.text.strip().lower()
-    mapping = {
-        "car": "car", "خودرو": "car", "ماشین": "car",
-        "resource": "resource", "منبع": "resource", "منابع": "resource",
-        "attachment": "attachment", "باربند": "attachment",
-    }
-    category = mapping.get(raw)
-    if not category:
-        await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
-        return 5
-
+    text = update.message.text.strip()
     data = context.user_data
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO items (name, category, buy_price, sell_price, image_url) VALUES (?,?,?,?,?)",
-            (data["name"], category, data["buy"], data["sell"], data.get("image"))
+    
+    if state == "waiting_name":
+        if not text or len(text) > 60:
+            await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
+            return
+        data["name"] = text
+        data["add_state"] = "waiting_buy"
+        await update.message.reply_text("💵 قیمت خرید رو فقط عدد بنویس:\nمثال: 1500")
+    
+    elif state == "waiting_buy":
+        value = parse_amount(text)
+        if value is None or value <= 0:
+            await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
+            return
+        data["buy"] = value
+        data["add_state"] = "waiting_sell"
+        await update.message.reply_text("♻️ قیمت فروش رو فقط عدد بنویس:\nمثال: 600")
+    
+    elif state == "waiting_sell":
+        value = parse_amount(text)
+        if value is None or value < 0:
+            await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
+            return
+        data["sell"] = value
+        data["add_state"] = "waiting_category"
+        await update.message.reply_text(
+            "🏷️ دسته‌بندی رو بنویس:\n\n"
+            "car → خودرو\n"
+            "resource → منابع\n"
+            "attachment → باربند"
         )
-        new_id = cur.lastrowid
     
-    context.user_data.clear()
+    elif state == "waiting_category":
+        raw = text.lower()
+        mapping = {
+            "car": "car", "خودرو": "car", "ماشین": "car",
+            "resource": "resource", "منبع": "resource", "منابع": "resource",
+            "attachment": "attachment", "باربند": "attachment",
+        }
+        category = mapping.get(raw)
+        if not category:
+            await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
+            return
+        
+        with db() as conn:
+            cur = conn.execute(
+                "INSERT INTO items (name, category, buy_price, sell_price, image_url) VALUES (?,?,?,?,?)",
+                (data["name"], category, data["buy"], data["sell"], data.get("image"))
+            )
+            new_id = cur.lastrowid
+        
+        context.user_data.clear()
+        
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
+        ])
+        caption = (
+            f"✅ آیتم ثبت شد!\n\n"
+            f"🆔 کد: {new_id}\n"
+            f"📛 اسم: {data['name']}\n"
+            f"🏷️ دسته: {CATEGORIES[category]}\n"
+            f"💵 خرید: {data['buy']:,} $\n"
+            f"♻️ فروش: {data['sell']:,} $"
+        )
+        if data.get("image"):
+            await update.message.reply_photo(photo=data["image"], caption=caption, reply_markup=markup)
+        else:
+            await update.message.reply_text(caption, reply_markup=markup)
+
+
+# ================= ویرایش آیتم (بدون ConversationHandler) =================
+async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
-        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
-    ])
-    caption = (
-        f"✅ آیتم ثبت شد!\n\n"
-        f"🆔 کد: {new_id}\n"
-        f"📛 اسم: {data['name']}\n"
-        f"🏷️ دسته: {CATEGORIES[category]}\n"
-        f"💵 خرید: {data['buy']:,} $\n"
-        f"♻️ فروش: {data['sell']:,} $"
-    )
-    if data.get("image"):
-        await update.message.reply_photo(photo=data["image"], caption=caption, reply_markup=markup)
-    else:
-        await update.message.reply_text(caption, reply_markup=markup)
-    return ConversationHandler.END
+    edit_state = context.user_data.get("edit_state")
+    if not edit_state:
+        return
+    
+    text = update.message.text.strip()
+    data = context.user_data.get("edit_data", {})
+    
+    if edit_state == "edit_price":
+        value = parse_amount(text)
+        if value is None or value < 0:
+            await update.message.reply_text("❌ یه عدد معتبر بنویس.")
+            return
+        field = data["field"]
+        with db() as conn:
+            conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, data["id"]))
+        context.user_data.pop("edit_state", None)
+        context.user_data.pop("edit_data", None)
+        label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
+        await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
+    
+    elif edit_state == "edit_name":
+        if not text or len(text) > 60:
+            await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
+            return
+        with db() as conn:
+            conn.execute("UPDATE items SET name=? WHERE id=?", (text, data["id"]))
+        context.user_data.pop("edit_state", None)
+        context.user_data.pop("edit_data", None)
+        await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
 
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ لغو شد.\nمی‌تونی دوباره /additem بزنی.")
-    return ConversationHandler.END
-
-
-# ================= ویرایش آیتم (مکالمه) =================
-EDIT_PRICE, EDIT_NAME, EDIT_PHOTO = range(1, 4)
-
-async def edit_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("❌ فقط ادمین.", show_alert=True)
-        return ConversationHandler.END
-    await q.answer()
-    parts = q.data.split("_")
-    field = "buy_price" if parts[0] == "eb" else "sell_price"
-    context.user_data["edit"] = {"id": int(parts[1]), "field": field}
-    label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
-    await replace_message(q, context, f"💵 {label} جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
-    return EDIT_PRICE
-
-async def edit_price_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("edit")
-    if not state:
-        await update.message.reply_text("❌ دوباره از لیست آیتم رو انتخاب کن.")
-        return ConversationHandler.END
-    value = parse_amount(update.message.text)
-    if value is None or value < 0:
-        await update.message.reply_text("❌ یه عدد معتبر بنویس.")
-        return EDIT_PRICE
-    with db() as conn:
-        conn.execute(f"UPDATE items SET {state['field']}=? WHERE id=?", (value, state["id"]))
-    context.user_data.pop("edit", None)
-    await update.message.reply_text(f"✅ قیمت به {value:,} $ تغییر کرد.")
-    return ConversationHandler.END
-
-async def edit_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("❌ فقط ادمین.", show_alert=True)
-        return ConversationHandler.END
-    await q.answer()
-    context.user_data["edit"] = {"id": int(q.data.split("_")[1]), "field": "name"}
-    await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
-    return EDIT_NAME
-
-async def edit_name_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("edit")
-    if not state:
-        return ConversationHandler.END
-    name = update.message.text.strip()
-    if not name or len(name) > 60:
-        await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
-        return EDIT_NAME
-    with db() as conn:
-        conn.execute("UPDATE items SET name=? WHERE id=?", (name, state["id"]))
-    context.user_data.pop("edit", None)
-    await update.message.reply_text(f"✅ اسم به «{name}» تغییر کرد.")
-    return ConversationHandler.END
-
-async def edit_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("❌ فقط ادمین.", show_alert=True)
-        return ConversationHandler.END
-    await q.answer()
-    context.user_data["edit"] = {"id": int(q.data.split("_")[1]), "field": "image"}
-    await replace_message(q, context, "📸 عکس جدید رو بفرست:\n(لغو با /cancel)")
-    return EDIT_PHOTO
-
-async def edit_photo_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("edit")
-    if not state:
-        return ConversationHandler.END
+async def handle_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    edit_state = context.user_data.get("edit_state")
+    if edit_state != "edit_photo":
+        return
+    
+    data = context.user_data.get("edit_data", {})
     file_id = update.message.photo[-1].file_id
     with db() as conn:
-        conn.execute("UPDATE items SET image_url=? WHERE id=?", (file_id, state["id"]))
-    context.user_data.pop("edit", None)
+        conn.execute("UPDATE items SET image_url=? WHERE id=?", (file_id, data["id"]))
+    context.user_data.pop("edit_state", None)
+    context.user_data.pop("edit_data", None)
     await update.message.reply_text("✅ عکس جایگزین شد.")
-    return ConversationHandler.END
 
 
 # ================= پنل ادمین: لیست / جزئیات / حذف =================
@@ -510,8 +469,7 @@ async def show_admin_list(query, context):
     with db() as conn:
         items = conn.execute("SELECT * FROM items ORDER BY id").fetchall()
     if not items:
-        await replace_message(query, context,
-                              "📋 فروشگاه خالی است.\nبرای افزودن دکمه زیر رو بزن.", admin_menu())
+        await replace_message(query, context, "📋 فروشگاه خالی است.\nبرای افزودن دکمه زیر رو بزن.", admin_menu())
         return
     text, markup = build_item_list(items)
     await replace_message(query, context, text, markup)
@@ -714,6 +672,12 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ این فایل بکاپ معتبر نیست.")
 
 
+# ================= لغو =================
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ لغو شد.")
+
+
 # ================= دیسپچر دکمه‌ها =================
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -743,6 +707,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_list":
         if is_admin(uid):
             await show_admin_list(q, context)
+    elif data == "admin_add":
+        if is_admin(uid):
+            context.user_data.clear()
+            context.user_data["add_state"] = "waiting_photo"
+            await replace_message(q, context, "📸 عکس آیتم رو بفرست.\n(لغو با /cancel)")
     elif data.startswith("item_"):
         if is_admin(uid) and data[5:].isdigit():
             await show_item_detail(q, context, int(data[5:]))
@@ -752,6 +721,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("del_"):
         if is_admin(uid) and data[4:].isdigit():
             await confirm_delete(q, context, int(data[4:]))
+    elif data.startswith("eb_"):
+        if is_admin(uid):
+            parts = data.split("_")
+            context.user_data["edit_state"] = "edit_price"
+            context.user_data["edit_data"] = {"id": int(parts[1]), "field": "buy_price"}
+            await replace_message(q, context, "💵 قیمت خرید جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
+    elif data.startswith("es_"):
+        if is_admin(uid):
+            parts = data.split("_")
+            context.user_data["edit_state"] = "edit_price"
+            context.user_data["edit_data"] = {"id": int(parts[1]), "field": "sell_price"}
+            await replace_message(q, context, "💵 قیمت فروش جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
+    elif data.startswith("en_"):
+        if is_admin(uid):
+            parts = data.split("_")
+            context.user_data["edit_state"] = "edit_name"
+            context.user_data["edit_data"] = {"id": int(parts[1])}
+            await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
+    elif data.startswith("ep_"):
+        if is_admin(uid):
+            parts = data.split("_")
+            context.user_data["edit_state"] = "edit_photo"
+            context.user_data["edit_data"] = {"id": int(parts[1])}
+            await replace_message(q, context, "📸 عکس جدید رو بفرست:\n(لغو با /cancel)")
 
 
 # ================= خطاها =================
@@ -769,51 +762,26 @@ def main():
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    add_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("additem", add_start),
-            CallbackQueryHandler(add_start, pattern=r"^admin_add$"),
-        ],
-        states={
-            1: [MessageHandler(filters.PHOTO, add_photo_step)],
-            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_step)],
-            3: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_buy_step)],
-            4: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_sell_step)],
-            5: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_category_step)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-        name="add_item_conv",
-    )
-
-    edit_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(edit_price_start, pattern=r"^e[bs]_\d+$"),
-            CallbackQueryHandler(edit_name_start, pattern=r"^en_\d+$"),
-            CallbackQueryHandler(edit_photo_start, pattern=r"^ep_\d+$"),
-        ],
-        states={
-            EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_price_value)],
-            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_value)],
-            EDIT_PHOTO: [MessageHandler(filters.PHOTO, edit_photo_value)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-        name="edit_item_conv",
-    )
-
     application = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(add_conv)
-    application.add_handler(edit_conv)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("additem", additem_start))
     application.add_handler(CommandHandler("listitems", cmd_list_items))
     application.add_handler(CommandHandler("wealth", wealth_command))
     application.add_handler(CommandHandler("backup", cmd_backup))
     application.add_handler(CommandHandler("restore", restore_backup))
+    application.add_handler(CommandHandler("cancel", cancel))
+    
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_edit_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_add))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
+    
     application.add_handler(CallbackQueryHandler(on_button))
-
     application.add_error_handler(on_error)
+    
     application.run_polling(drop_pending_updates=True)
 
 
