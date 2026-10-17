@@ -84,6 +84,8 @@ def normalize_digits(text):
     return text
 
 def parse_amount(text):
+    if not text:
+        return None
     s = normalize_digits(text).replace(",", "").replace("،", "").replace(" ", "")
     if not s or not s.isascii() or not s.isdigit():
         return None
@@ -292,11 +294,16 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     
+    if not update.message or not update.message.text:
+        return
+    
     mode = context.user_data.get("mode")
     if not mode:
         return
     
     text = update.message.text.strip()
+    if not text:
+        return
     
     try:
         if mode == "add":
@@ -492,11 +499,13 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     msg = update.message
-    if not msg.reply_to_message:
+    if not msg or not msg.reply_to_message or not msg.text:
         return
     target = msg.reply_to_message.from_user.id
     target_name = msg.reply_to_message.from_user.username or "player"
     text = msg.text.strip()
+    if not text:
+        return
     low = text.lower()
 
     with db() as conn:
@@ -739,8 +748,8 @@ def main():
     application.add_handler(CommandHandler("restore", restore_backup))
     application.add_handler(CommandHandler("cancel", cancel))
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     
     application.add_handler(CallbackQueryHandler(on_button))
     application.add_error_handler(on_error)
