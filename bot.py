@@ -213,6 +213,8 @@ async def show_category(query, context, category):
 
 async def buy_item(query, context, item_id):
     uid = query.from_user.id
+    username = query.from_user.username or "Unknown"
+    
     with db() as conn:
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item:
@@ -244,6 +246,27 @@ async def buy_item(query, context, item_id):
         if item["category"] == "car":
             cars.append(item["name"])
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), uid))
+    
+    # ارسال اعلان به ادمین
+    admin_msg = (
+        f"🛒 **سفارش جدید!**\n\n"
+        f"👤 پلیر: @{username}\n"
+        f"🆔 آیدی: `{uid}`\n"
+        f"📦 آیتم: {item['name']}\n"
+        f"️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
+        f" قیمت: {item['buy_price']:,} $\n\n"
+        f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_msg,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send admin notification: {e}")
+    
     await replace_message(
         query, context,
         f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n"
