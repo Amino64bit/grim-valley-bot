@@ -321,6 +321,22 @@ async def process_add(update, context, text):
     data = context.user_data
     state = data.get("add_state")
     
+    # چک کنیم که داده‌های قبلی وجود دارن
+    if state == "waiting_buy" and "name" not in data:
+        data["add_state"] = "waiting_name"
+        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
+        return
+    
+    if state == "waiting_sell" and ("name" not in data or "buy" not in data):
+        data["add_state"] = "waiting_name"
+        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
+        return
+    
+    if state == "waiting_category" and ("name" not in data or "buy" not in data or "sell" not in data):
+        data["add_state"] = "waiting_name"
+        await update.message.reply_text("❌ اطلاعات قبلی پاک شده. دوباره اسم آیتم رو بنویس:")
+        return
+    
     if state == "waiting_name":
         if not text or len(text) > 60:
             await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
@@ -362,6 +378,11 @@ async def process_add(update, context, text):
         category = mapping.get(raw)
         if not category:
             await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
+            return
+        
+        # چک نهایی قبل از ذخیره
+        if "name" not in data or "buy" not in data or "sell" not in data:
+            await update.message.reply_text("❌ اطلاعات ناقصه. دوباره /additem بزن.")
             return
         
         with db() as conn:
