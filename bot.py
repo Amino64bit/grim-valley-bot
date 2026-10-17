@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8725147253:AAEV-vZc1bNzS-Gk4HYDGLpQtdQagsvtEdg"
 ADMIN_ID = 5591238725
 DB_FILE = "grim_valley.db"
-MAX_CARS = 4
+MAX_CARS = 3
 HOUSE_VALUE = 2500
 REPAIR_COST = 400
 
