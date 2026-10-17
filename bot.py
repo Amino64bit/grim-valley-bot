@@ -213,7 +213,8 @@ async def show_category(query, context, category):
 
 async def buy_item(query, context, item_id):
     uid = query.from_user.id
-username = query.from_user.username or query.from_user.first_name or "ناشناس"    
+    username = query.from_user.username or query.from_user.first_name or "ناشناس"
+    
     with db() as conn:
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item:
@@ -225,20 +226,12 @@ username = query.from_user.username or query.from_user.first_name or "ناشنا
             return
         cars = get_cars(player)
         if item["category"] == "car" and len(cars) >= MAX_CARS:
-            await replace_message(query, context,
-                                  f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.",
-                                  back_main())
+            await replace_message(query, context, f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.", back_main())
             return
         if player["cash"] < item["buy_price"]:
-            await replace_message(query, context,
-                                  f"❌ پولت کمه!\n💰 داری: {player['cash']:,} $\n"
-                                  f"💵 نیاز داری: {item['buy_price']:,} $",
-                                  back_main())
+            await replace_message(query, context, f"❌ پولت کمه!\n💰 داری: {player['cash']:,} $\n💵 نیاز داری: {item['buy_price']:,} $", back_main())
             return
-        cur = conn.execute(
-            "UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?",
-            (item["buy_price"], uid, item["buy_price"])
-        )
+        cur = conn.execute("UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?", (item["buy_price"], uid, item["buy_price"]))
         if cur.rowcount != 1:
             await replace_message(query, context, "❌ موجودی کافی نیست.", back_main())
             return
@@ -246,41 +239,29 @@ username = query.from_user.username or query.from_user.first_name or "ناشنا
             cars.append(item["name"])
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), uid))
     
-    # ارسال اعلان به ادمین
     admin_msg = (
         f"🛒 **سفارش جدید!**\n\n"
-        f"👤 پلیر: @{username}\n"
+        f" پلیر: {username}\n"
         f"🆔 آیدی: `{uid}`\n"
         f"📦 آیتم: {item['name']}\n"
-        f"️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
-        f" قیمت: {item['buy_price']:,} $\n\n"
+        f"🏷️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
+        f"💰 قیمت: {item['buy_price']:,} $\n\n"
         f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     
-        # ارسال به ادمین اول
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=admin_msg,
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Failed to send admin notification: {e}")
-    
-    # ارسال به ادمین دوم
+        
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID_2,
-            text=admin_msg,
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID_2, text=admin_msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Failed to send admin notification to second admin: {e}")
-    
+
     await replace_message(
         query, context,
-        f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n"
-        f"📦 برای تحویل گرفتن به ادمین سرور پیام بده.",
+        f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n برای تحویل گرفتن به ادمین سرور پیام بده.",
         back_main()
     )
 
@@ -715,7 +696,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("buy_"):
         raw = data[4:]
         if raw.isdigit():
-            await buy_item(q, context, int(raw))
+            await (q, context, int(raw))
     elif data == "admin_backup":
         if is_admin(uid):
             await send_backup(q.message.chat_id, context)
