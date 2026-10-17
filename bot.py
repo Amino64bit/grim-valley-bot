@@ -284,19 +284,32 @@ async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     context.user_data.clear()
+    context.user_data["mode"] = "add"
     context.user_data["add_state"] = "waiting_name"
     await update.message.reply_text("✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
 
-async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     
-    state = context.user_data.get("add_state")
-    if not state:
+    mode = context.user_data.get("mode")
+    if not mode:
         return
     
     text = update.message.text.strip()
+    
+    try:
+        if mode == "add":
+            await process_add(update, context, text)
+        elif mode == "edit":
+            await process_edit(update, context, text)
+    except Exception as e:
+        logger.error(f"Error in handle_text_input: {e}", exc_info=True)
+        await update.message.reply_text(f"⚠️ خطا: {str(e)}")
+
+async def process_add(update, context, text):
     data = context.user_data
+    state = data.get("add_state")
     
     if state == "waiting_name":
         if not text or len(text) > 60:
@@ -364,40 +377,30 @@ async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         await update.message.reply_text(caption, reply_markup=markup)
 
-
-# ================= ویرایش آیتم (فقط متن) =================
-async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+async def process_edit(update, context, text):
+    data = context.user_data
+    state = data.get("edit_state")
+    edit_data = data.get("edit_data", {})
     
-    edit_state = context.user_data.get("edit_state")
-    if not edit_state:
-        return
-    
-    text = update.message.text.strip()
-    data = context.user_data.get("edit_data", {})
-    
-    if edit_state == "edit_price":
+    if state == "edit_price":
         value = parse_amount(text)
         if value is None or value < 0:
             await update.message.reply_text("❌ یه عدد معتبر بنویس.")
             return
-        field = data["field"]
+        field = edit_data["field"]
         with db() as conn:
-            conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, data["id"]))
-        context.user_data.pop("edit_state", None)
-        context.user_data.pop("edit_data", None)
+            conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, edit_data["id"]))
+        context.user_data.clear()
         label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
         await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
     
-    elif edit_state == "edit_name":
+    elif state == "edit_name":
         if not text or len(text) > 60:
             await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
             return
         with db() as conn:
-            conn.execute("UPDATE items SET name=? WHERE id=?", (text, data["id"]))
-        context.user_data.pop("edit_state", None)
-        context.user_data.pop("edit_data", None)
+            conn.execute("UPDATE items SET name=? WHERE id=?", (text, edit_data["id"]))
+        context.user_data.clear()
         await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
 
 
@@ -671,6 +674,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_add":
         if is_admin(uid):
             context.user_data.clear()
+            context.user_data["mode"] = "add"
             context.user_data["add_state"] = "waiting_name"
             await replace_message(q, context, "✏️ اسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
     elif data.startswith("item_"):
@@ -685,18 +689,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("eb_"):
         if is_admin(uid):
             parts = data.split("_")
+            context.user_data.clear()
+            context.user_data["mode"] = "edit"
             context.user_data["edit_state"] = "edit_price"
             context.user_data["edit_data"] = {"id": int(parts[1]), "field": "buy_price"}
             await replace_message(q, context, "💵 قیمت خرید جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
     elif data.startswith("es_"):
         if is_admin(uid):
             parts = data.split("_")
+            context.user_data.clear()
+            context.user_data["mode"] = "edit"
             context.user_data["edit_state"] = "edit_price"
             context.user_data["edit_data"] = {"id": int(parts[1]), "field": "sell_price"}
             await replace_message(q, context, "💵 قیمت فروش جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
     elif data.startswith("en_"):
         if is_admin(uid):
             parts = data.split("_")
+            context.user_data.clear()
+            context.user_data["mode"] = "edit"
             context.user_data["edit_state"] = "edit_name"
             context.user_data["edit_data"] = {"id": int(parts[1])}
             await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
@@ -707,7 +717,8 @@ async def on_error(update, context):
     logger.error("Update caused error: %s", context.error, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("⚠️ یه خطای داخلی پیش اومد. دوباره /start بزن.")
+            error_msg = str(context.error)[:300]
+            await update.effective_message.reply_text(f"⚠️ خطا:\n{error_msg}")
         except TelegramError:
             pass
 
@@ -728,8 +739,7 @@ def main():
     application.add_handler(CommandHandler("restore", restore_backup))
     application.add_handler(CommandHandler("cancel", cancel))
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_add))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
     
     application.add_handler(CallbackQueryHandler(on_button))
