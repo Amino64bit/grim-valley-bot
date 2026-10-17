@@ -139,8 +139,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid = update.effective_user.id
-    name = update.effective_user.username or "player"
-    with db() as conn:
+name = update.effective_user.username or update.effective_user.first_name or "پلیر"    with db() as conn:
         ensure_player(conn, uid, name)
         conn.execute("UPDATE players SET username=? WHERE user_id=?", (name, uid))
     await update.message.reply_text(
@@ -214,8 +213,7 @@ async def show_category(query, context, category):
 
 async def buy_item(query, context, item_id):
     uid = query.from_user.id
-    username = query.from_user.username or "Unknown"
-    
+username = query.from_user.username or query.from_user.first_name or "ناشناس"    
     with db() as conn:
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item:
