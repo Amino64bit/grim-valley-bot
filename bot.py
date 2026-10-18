@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ================= تنظیمات =================
 # توکن رو توی محیط (Environment Variable) روی هاستت بذار، نه توی کد
-BOT_TOKEN = os.environ.get("8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk", "")
+BOT_TOKEN = "8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk"
 ADMIN_ID = 5591238725
 ADMIN_ID_2 = 6270844351
 DB_FILE = "grim_valley.db"
@@ -98,6 +98,10 @@ def init_db():
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
         if "photo_id" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN photo_id TEXT")
+        if "is_real" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN is_real INTEGER NOT NULL DEFAULT 0")
+        if "real_price" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN real_price TEXT")
         conn.execute("DELETE FROM panels WHERE created < ?", (int(time.time()) - 7 * 86400,))
 
 
@@ -136,6 +140,12 @@ def user_label(user):
     return user.username or user.first_name or "پلیر"
 
 
+def price_label(it):
+    if it["is_real"]:
+        return f"💶 {it['real_price']}"
+    return f"{it['buy_price']:,}$"
+
+
 # ---------- کیبوردها ----------
 def main_menu():
     return InlineKeyboardMarkup([
@@ -161,6 +171,12 @@ def admin_menu():
 
 def cancel_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")]])
+
+
+def category_markup():
+    kb = [[InlineKeyboardButton(label, callback_data="addcat_" + key)] for key, label in CATEGORIES.items()]
+    kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")])
+    return InlineKeyboardMarkup(kb)
 
 
 # ---------- مالکیت منوها ----------
@@ -284,7 +300,7 @@ def asset_text(conn, player):
     car_value = 0
     for name in cars:
         row = conn.execute(
-            "SELECT buy_price FROM items WHERE name=? AND category='car' ORDER BY id LIMIT 1", (name,)
+            "SELECT buy_price FROM items WHERE name=? AND category='car' AND is_real=0 ORDER BY id LIMIT 1", (name,)
         ).fetchone()
         if row:
             car_value += row["buy_price"]
@@ -330,7 +346,7 @@ async def show_category(query, context, category):
     keyboard, row = [], []
     for it in items:
         icon = "🖼 " if it["photo_id"] else ""
-        label = f"{icon}{it['name']} | {it['buy_price']:,}$"
+        label = f"{icon}{it['name']} | {price_label(it)}"
         row.append(InlineKeyboardButton(label[:48], callback_data="pick_" + str(it["id"])))
         if len(row) == 2:
             keyboard.append(row)
@@ -352,10 +368,15 @@ async def show_item(query, context, item_id):
     text = (
         f"📛 {it['name']}\n"
         f"🏷️ دسته: {CATEGORIES.get(it['category'], it['category'])}\n"
-        f"💵 قیمت: {it['buy_price']:,} $"
+        f"💵 قیمت: {price_label(it)}"
     )
+    if it["is_real"]:
+        text += "\n\n💶 این آیتم با پول واقعیه و به دارایی بازی‌ات ربطی نداره. ادمین باهات هماهنگ می‌کنه."
+        buy_btn = InlineKeyboardButton("💶 درخواست خرید", callback_data="rq_" + str(it["id"]))
+    else:
+        buy_btn = InlineKeyboardButton(f"🛒 خرید ({it['buy_price']:,}$)", callback_data="buy_" + str(it["id"]))
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🛒 خرید ({it['buy_price']:,}$)", callback_data="buy_" + str(it["id"]))],
+        [buy_btn],
         [InlineKeyboardButton("🔙 برگشت", callback_data="cat_" + it["category"]),
          InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
     ])
@@ -367,7 +388,7 @@ def try_buy(uid, item_id):
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
-        if not item:
+        if not item or item["is_real"]:
             return "no_item", None, 0
         player = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
         if not player:
@@ -382,6 +403,77 @@ def try_buy(uid, item_id):
             cars.append(item["name"])
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), uid))
         return "ok", item, player["cash"] - item["buy_price"]
+
+
+async def notify_admins(context, user, item):
+    real = bool(item["is_real"])
+    uname = f"@{escape(user.username)}" if user.username else "ندارد"
+    if real:
+        head = "💶 <b>درخواست خرید پولی!</b>"
+        price = f"💶 قیمت: {escape(item['real_price'] or '')}"
+        note = "\n\n📞 باید با این پلیر هماهنگ کنی و پیگیری کنی. (چیزی از دارایی بازی‌اش کم نشده)"
+    else:
+        head = "🛒 <b>سفارش جدید!</b>"
+        price = f"💰 قیمت: {item['buy_price']:,} $"
+        note = ""
+    msg = (
+        f"{head}\n\n"
+        f"👤 نام: <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a>\n"
+        f"🔗 یوزرنیم: {uname}\n"
+        f"🆔 آیدی: <code>{user.id}</code>\n"
+        f"📦 آیتم: {escape(item['name'])}\n"
+        f"🏷️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
+        f"{price}\n\n"
+        f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}{note}"
+    )
+    for admin in (ADMIN_ID, ADMIN_ID_2):
+        try:
+            if item["photo_id"]:
+                await context.bot.send_photo(chat_id=admin, photo=item["photo_id"],
+                                             caption=msg, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=admin, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error("Failed to notify admin %s: %s", admin, e)
+
+
+_real_cooldown = {}
+REAL_COOLDOWN = 120  # ثانیه؛ جلوگیری از درخواست تکراری برای یک آیتم
+
+
+async def confirm_real(query, context, item_id):
+    with db() as conn:
+        it = conn.execute("SELECT * FROM items WHERE id=? AND is_real=1", (item_id,)).fetchone()
+    if not it:
+        await show(query, context, "❌ آیتم پیدا نشد.", back_main())
+        return
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ بله، درخواست بده", callback_data="rqy_" + str(item_id)),
+         InlineKeyboardButton("❌ نه", callback_data="pick_" + str(item_id))],
+    ])
+    await show(query, context,
+               f"💶 می‌خوای «{it['name']}» رو به قیمت {it['real_price']} بخری؟\n\n"
+               f"با تأیید، درخواستت برای ادمین ارسال میشه و ادمین باهات هماهنگ می‌کنه.", markup)
+
+
+async def send_real_request(query, context, item_id):
+    user = query.from_user
+    with db() as conn:
+        it = conn.execute("SELECT * FROM items WHERE id=? AND is_real=1", (item_id,)).fetchone()
+    if not it:
+        await show(query, context, "❌ آیتم پیدا نشد.", back_main())
+        return
+    now = time.monotonic()
+    if len(_real_cooldown) > 5000:
+        _real_cooldown.clear()
+    if now - _real_cooldown.get((user.id, item_id), -REAL_COOLDOWN) < REAL_COOLDOWN:
+        await show(query, context, "⏳ درخواستت قبلاً ارسال شده. منتظر پیام ادمین باش.", back_main())
+        return
+    _real_cooldown[(user.id, item_id)] = now
+    await notify_admins(context, user, it)
+    await show(query, context,
+               f"✅ درخواست خرید «{it['name']}» برای ادمین ارسال شد.\n"
+               f"📩 ادمین به‌زودی باهات تماس می‌گیره.", back_main())
 
 
 async def buy_item(query, context, item_id):
@@ -402,26 +494,7 @@ async def buy_item(query, context, item_id):
                    f"❌ پولت کمه!\n💰 داری: {cash:,} $\n💵 نیاز داری: {item['buy_price']:,} $", back_main())
         return
 
-    uname = f"@{escape(user.username)}" if user.username else "ندارد"
-    admin_msg = (
-        f"🛒 <b>سفارش جدید!</b>\n\n"
-        f"👤 نام: <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a>\n"
-        f"🔗 یوزرنیم: {uname}\n"
-        f"🆔 آیدی: <code>{user.id}</code>\n"
-        f"📦 آیتم: {escape(item['name'])}\n"
-        f"🏷️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
-        f"💰 قیمت: {item['buy_price']:,} $\n\n"
-        f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    )
-    for admin in (ADMIN_ID, ADMIN_ID_2):
-        try:
-            if item["photo_id"]:
-                await context.bot.send_photo(chat_id=admin, photo=item["photo_id"],
-                                             caption=admin_msg, parse_mode=ParseMode.HTML)
-            else:
-                await context.bot.send_message(chat_id=admin, text=admin_msg, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error("Failed to notify admin %s: %s", admin, e)
+    await notify_admins(context, user, item)
 
     await show(query, context,
                f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n"
@@ -457,7 +530,7 @@ async def give_daily(query, context):
 
 
 # ================= افزودن / ویرایش آیتم (ادمین) =================
-ADD_NAME_PROMPT = "✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van"
+ADD_NAME_PROMPT = "✏️ مرحله ۱ از ۵:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van"
 
 
 async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,14 +545,16 @@ async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def finish_add(context, chat_id, owner_id, photo_id):
     ud = context.user_data
     name, buy, category = ud.get("item_name"), ud.get("item_buy"), ud.get("item_cat")
-    if not (name and buy and category):
+    real_price = ud.get("item_real_price") if ud.get("item_real") else None
+    if not (name and category) or buy is None or (ud.get("item_real") and not real_price):
         ud.clear()
         await send_panel(context, chat_id, owner_id, "❌ اطلاعات ناقص بود. دوباره شروع کن.", admin_menu())
         return
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO items (name, category, buy_price, sell_price, photo_id) VALUES (?,?,?,0,?)",
-            (name, category, buy, photo_id),
+            "INSERT INTO items (name, category, buy_price, sell_price, photo_id, is_real, real_price)"
+            " VALUES (?,?,?,0,?,?,?)",
+            (name, category, buy, photo_id, 1 if real_price else 0, real_price),
         )
         new_id = cur.lastrowid
     ud.clear()
@@ -488,7 +563,8 @@ async def finish_add(context, chat_id, owner_id, photo_id):
         [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
     ])
     text = (f"✅ آیتم ثبت شد!\n\n🆔 کد: {new_id}\n📛 اسم: {name}\n"
-            f"🏷️ دسته: {CATEGORIES[category]}\n💵 قیمت: {buy:,} $\n🖼 عکس: {'دارد' if photo_id else 'ندارد'}")
+            f"🏷️ دسته: {CATEGORIES[category]}\n"
+            f"💵 قیمت: {('💶 ' + real_price + ' (پولی)') if real_price else format(buy, ',') + ' $'}\n🖼 عکس: {'دارد' if photo_id else 'ندارد'}")
     await send_panel(context, chat_id, owner_id, text, markup, photo=photo_id)
 
 
@@ -502,31 +578,54 @@ async def handle_admin_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_panel(update, "❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.", cancel_markup())
                 return
             ud["item_name"] = text
-            ud["step"] = "price"
-            await reply_panel(update, "✏️ مرحله ۲ از ۴:\nقیمت رو فقط عدد بنویس:\nمثال: 1500", cancel_markup())
+            ud["step"] = "type"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 با پول بازی", callback_data="addtype_game")],
+                [InlineKeyboardButton("💶 پولی (پول واقعی)", callback_data="addtype_real")],
+                [InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")],
+            ])
+            await reply_panel(update, "✏️ مرحله ۲ از ۵:\nاین آیتم با چی خریده میشه؟", kb)
         elif step == "price":
-            value = parse_amount(text)
-            if value is None or value <= 0:
-                await reply_panel(update, "❌ یه عدد مثبت بنویس. مثال: 1500", cancel_markup())
-                return
-            ud["item_buy"] = value
+            if ud.get("item_real"):
+                price_text = normalize_digits(text).strip()
+                if not price_text or len(price_text) > 30:
+                    await reply_panel(update, "❌ قیمت رو با واحد بنویس (حداکثر ۳۰ حرف). مثال: 20 یورو", cancel_markup())
+                    return
+                ud["item_real_price"] = price_text
+                ud["item_buy"] = 0
+            else:
+                value = parse_amount(text)
+                if value is None or value <= 0:
+                    await reply_panel(update, "❌ یه عدد مثبت بنویس. مثال: 1500", cancel_markup())
+                    return
+                ud["item_buy"] = value
             ud["step"] = "category"
-            kb = [[InlineKeyboardButton(label, callback_data="addcat_" + key)] for key, label in CATEGORIES.items()]
-            kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")])
-            await reply_panel(update, "✏️ مرحله ۳ از ۴:\nدسته‌بندی رو انتخاب کن:", InlineKeyboardMarkup(kb))
-        elif step in ("category", "photo"):
+            await reply_panel(update, "✏️ مرحله ۴ از ۵:\nدسته‌بندی رو انتخاب کن:", category_markup())
+        elif step in ("type", "category", "photo"):
             await reply_panel(update, "👆 از دکمه‌های همین مرحله استفاده کن"
                               + (" یا عکس بفرست." if step == "photo" else "."), cancel_markup())
         elif edit_step == "edit_price":
-            value = parse_amount(text)
-            if value is None or value <= 0:
-                await reply_panel(update, "❌ یه عدد معتبر بنویس.", cancel_markup())
-                return
-            with db() as conn:
-                conn.execute("UPDATE items SET buy_price=? WHERE id=?", (value, ud.get("edit_id")))
             item_id = ud.get("edit_id")
-            ud.clear()
-            await reply_panel(update, f"✅ قیمت به {value:,} $ تغییر کرد.", item_back_markup(item_id))
+            with db() as conn:
+                it = conn.execute("SELECT is_real FROM items WHERE id=?", (item_id,)).fetchone()
+            if it and it["is_real"]:
+                price_text = normalize_digits(text).strip()
+                if not price_text or len(price_text) > 30:
+                    await reply_panel(update, "❌ قیمت رو با واحد بنویس. مثال: 20 یورو", cancel_markup())
+                    return
+                with db() as conn:
+                    conn.execute("UPDATE items SET real_price=? WHERE id=?", (price_text, item_id))
+                ud.clear()
+                await reply_panel(update, f"✅ قیمت به {price_text} تغییر کرد.", item_back_markup(item_id))
+            else:
+                value = parse_amount(text)
+                if value is None or value <= 0:
+                    await reply_panel(update, "❌ یه عدد معتبر بنویس.", cancel_markup())
+                    return
+                with db() as conn:
+                    conn.execute("UPDATE items SET buy_price=? WHERE id=?", (value, item_id))
+                ud.clear()
+                await reply_panel(update, f"✅ قیمت به {value:,} $ تغییر کرد.", item_back_markup(item_id))
         elif edit_step == "edit_name":
             if not text or len(text) > 60:
                 await reply_panel(update, "❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).", cancel_markup())
@@ -580,7 +679,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_item_list(items):
     keyboard, row = [], []
     for it in items:
-        label = f"{it['name']} | {it['buy_price']:,}$"
+        label = f"{it['name']} | {price_label(it)}"
         row.append(InlineKeyboardButton(label[:45], callback_data="item_" + str(it["id"])))
         if len(row) == 2:
             keyboard.append(row)
@@ -624,7 +723,8 @@ async def show_item_detail(query, context, item_id):
         f"🆔 کد: {it['id']}\n"
         f"📛 اسم: {it['name']}\n"
         f"🏷️ دسته: {CATEGORIES.get(it['category'], it['category'])}\n"
-        f"💵 قیمت: {it['buy_price']:,} $\n"
+        f"📌 نوع: {'پولی (پول واقعی)' if it['is_real'] else 'بازی'}\n"
+        f"💵 قیمت: {price_label(it)}\n"
         f"🖼 عکس: {'دارد' if it['photo_id'] else 'ندارد'}"
     )
     i = str(it["id"])
@@ -864,6 +964,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_item(q, context, num)
     elif data.startswith("buy_") and num is not None:
         await buy_item(q, context, num)
+    elif data.startswith("rqy_") and num is not None:
+        await send_real_request(q, context, num)
+    elif data.startswith("rq_") and num is not None:
+        await confirm_real(q, context, num)
 
     # ----- ادمین -----
     elif not admin:
@@ -879,6 +983,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         context.user_data["step"] = "name"
         await show(q, context, ADD_NAME_PROMPT, cancel_markup())
+    elif data.startswith("addtype_"):
+        if context.user_data.get("step") == "type" and data[8:] in ("game", "real"):
+            real = data[8:] == "real"
+            context.user_data["item_real"] = real
+            context.user_data["step"] = "price"
+            if real:
+                prompt = "✏️ مرحله ۳ از ۵:\nقیمت پولی رو با واحدش بنویس:\nمثال: 20 یورو"
+            else:
+                prompt = "✏️ مرحله ۳ از ۵:\nقیمت رو فقط عدد بنویس:\nمثال: 1500"
+            await show(q, context, prompt, cancel_markup())
     elif data.startswith("addcat_"):
         cat = data[7:]
         if context.user_data.get("step") == "category" and cat in CATEGORIES:
@@ -888,7 +1002,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⏭ بدون عکس", callback_data="add_skip_photo")],
                 [InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")],
             ])
-            await show(q, context, "🖼 مرحله ۴ از ۴:\nیه عکس برای آیتم بفرست (اختیاریه):", kb)
+            await show(q, context, "🖼 مرحله ۵ از ۵:\nیه عکس برای آیتم بفرست (اختیاریه):", kb)
     elif data == "add_skip_photo":
         if context.user_data.get("step") == "photo":
             await safe_delete(msg)
