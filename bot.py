@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ================= تنظیمات =================
-BOT_TOKEN = "8725147253:AAEV-vZc1bNzS-Gk4HYDGLpQtdQagsvtEdg"
+BOT_TOKEN = "8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk"
 ADMIN_ID = 5591238725
 ADMIN_ID_2 = 6270844351  # <<< آیدی عددی ادمین دوم را اینجا وارد کنید
 DB_FILE = "grim_valley.db"
