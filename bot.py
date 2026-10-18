@@ -30,8 +30,8 @@ ADMIN_ID = 5591238725
 ADMIN_ID_2 = 6270844351
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
-HOUSE_VALUE = 0
-REPAIR_COST = 0
+HOUSE_VALUE = 2500
+REPAIR_COST = 400
 
 # ضد اسپم: بیشتر از RATE_MAX عمل در RATE_WINDOW ثانیه => RATE_BLOCK ثانیه بلاک
 RATE_WINDOW = 10
@@ -42,7 +42,12 @@ CATEGORIES = {
     "car": "🚗 خودرو",
     "resource": "💎 منابع",
     "attachment": "📦 باربند",
+    "weapon": "🔫 اسلحه",
+    "food": "🍖 غذا",
+    "backpack": "🎒 کوله‌پشتی",
+    "tool": "🛠 ابزار",
 }
+PAGE_SIZE = 5  # تعداد آیتم در هر صفحه
 # ==========================================
 
 flask_app = Flask(__name__)
@@ -138,6 +143,32 @@ def ensure_player(conn, uid, username="player"):
 
 def user_label(user):
     return user.username or user.first_name or "پلیر"
+
+
+def paginate(items, page):
+    total = max(1, -(-len(items) // PAGE_SIZE))
+    page = min(max(page, 0), total - 1)
+    return items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page, total
+
+
+def page_nav(prefix, page, total):
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"{prefix}{page - 1}"))
+    if page < total - 1:
+        row.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"{prefix}{page + 1}"))
+    return row
+
+
+def page_of_item(it, by_category=True):
+    """آیتم توی کدوم صفحه‌ست (برای دکمه برگشت)."""
+    with db() as conn:
+        if by_category:
+            n = conn.execute("SELECT COUNT(*) FROM items WHERE category=? AND id<?",
+                             (it["category"], it["id"])).fetchone()[0]
+        else:
+            n = conn.execute("SELECT COUNT(*) FROM items WHERE id<?", (it["id"],)).fetchone()[0]
+    return n // PAGE_SIZE
 
 
 def price_label(it):
@@ -331,20 +362,22 @@ async def show_shop(query, context):
     if not rows:
         await show(query, context, "🛒 فروشگاه فعلاً خالی است.", back_main())
         return
-    keyboard = [[InlineKeyboardButton(CATEGORIES.get(r["category"], r["category"]),
-                                     callback_data="cat_" + r["category"])] for r in rows]
+    order = list(CATEGORIES)
+    cats = sorted((r["category"] for r in rows), key=lambda c: order.index(c) if c in order else 99)
+    keyboard = [[InlineKeyboardButton(CATEGORIES.get(c, c), callback_data=f"cat_{c}_0")] for c in cats]
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
     await show(query, context, "🛒 فروشگاه تریدر\n\nیک دسته رو انتخاب کن:", InlineKeyboardMarkup(keyboard))
 
 
-async def show_category(query, context, category):
+async def show_category(query, context, category, page=0):
     with db() as conn:
         items = conn.execute("SELECT * FROM items WHERE category=? ORDER BY id", (category,)).fetchall()
     if not items:
         await show(query, context, "📦 این دسته فعلاً خالی است.", back_main())
         return
+    chunk, page, total = paginate(items, page)
     keyboard, row = [], []
-    for it in items:
+    for it in chunk:
         icon = "🖼 " if it["photo_id"] else ""
         label = f"{icon}{it['name']} | {price_label(it)}"
         row.append(InlineKeyboardButton(label[:48], callback_data="pick_" + str(it["id"])))
@@ -353,10 +386,15 @@ async def show_category(query, context, category):
             row = []
     if row:
         keyboard.append(row)
+    nav = page_nav(f"cat_{category}_", page, total)
+    if nav:
+        keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("🔙 دسته‌بندی‌ها", callback_data="shop")])
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
-    await show(query, context, f"{CATEGORIES.get(category, category)}\n\nیک آیتم رو انتخاب کن:",
-               InlineKeyboardMarkup(keyboard))
+    title = CATEGORIES.get(category, category)
+    if total > 1:
+        title += f"  (صفحه {page + 1} از {total})"
+    await show(query, context, f"{title}\n\nیک آیتم رو انتخاب کن:", InlineKeyboardMarkup(keyboard))
 
 
 async def show_item(query, context, item_id):
@@ -377,7 +415,7 @@ async def show_item(query, context, item_id):
         buy_btn = InlineKeyboardButton(f"🛒 خرید ({it['buy_price']:,}$)", callback_data="buy_" + str(it["id"]))
     markup = InlineKeyboardMarkup([
         [buy_btn],
-        [InlineKeyboardButton("🔙 برگشت", callback_data="cat_" + it["category"]),
+        [InlineKeyboardButton("🔙 برگشت", callback_data=f"cat_{it['category']}_{page_of_item(it)}"),
          InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
     ])
     await show(query, context, text, markup, photo=it["photo_id"])
@@ -676,9 +714,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================= پنل ادمین: لیست / جزئیات / حذف =================
-def build_item_list(items):
+def build_item_list(items, page=0):
+    chunk, page, total = paginate(items, page)
     keyboard, row = [], []
-    for it in items:
+    for it in chunk:
         label = f"{it['name']} | {price_label(it)}"
         row.append(InlineKeyboardButton(label[:45], callback_data="item_" + str(it["id"])))
         if len(row) == 2:
@@ -686,9 +725,15 @@ def build_item_list(items):
             row = []
     if row:
         keyboard.append(row)
+    nav = page_nav("alp_", page, total)
+    if nav:
+        keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("➕ افزودن آیتم", callback_data="admin_add")])
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
-    return "📋 لیست آیتم‌ها — برای ویرایش روی یک آیتم بزن:", InlineKeyboardMarkup(keyboard)
+    title = "📋 لیست آیتم‌ها — برای ویرایش روی یک آیتم بزن:"
+    if total > 1:
+        title += f"\n(صفحه {page + 1} از {total})"
+    return title, InlineKeyboardMarkup(keyboard)
 
 
 async def cmd_list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,13 +748,13 @@ async def cmd_list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_panel(update, text, markup)
 
 
-async def show_admin_list(query, context):
+async def show_admin_list(query, context, page=0):
     with db() as conn:
         items = conn.execute("SELECT * FROM items ORDER BY id").fetchall()
     if not items:
         await show(query, context, "📋 فروشگاه خالی است.\nبرای افزودن دکمه زیر رو بزن.", admin_menu())
         return
-    text, markup = build_item_list(items)
+    text, markup = build_item_list(items, page)
     await show(query, context, text, markup)
 
 
@@ -733,7 +778,7 @@ async def show_item_detail(query, context, item_id):
          InlineKeyboardButton("✏️ اسم", callback_data="en_" + i)],
         [InlineKeyboardButton("🖼 تغییر عکس", callback_data="ep_" + i)],
         [InlineKeyboardButton("🗑️ حذف آیتم", callback_data="del_" + i)],
-        [InlineKeyboardButton("📋 لیست", callback_data="admin_list"),
+        [InlineKeyboardButton("📋 لیست", callback_data=f"alp_{page_of_item(it, False)}"),
          InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
     ])
     await show(query, context, text, markup, photo=it["photo_id"])
@@ -959,7 +1004,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "daily":
         await give_daily(q, context)
     elif data.startswith("cat_"):
-        await show_category(q, context, data[4:])
+        rest = data[4:]
+        cat, sep, pg = rest.rpartition("_")
+        if not sep or not pg.isdigit():
+            cat, pg = rest, "0"
+        await show_category(q, context, cat, int(pg))
     elif data.startswith("pick_") and num is not None:
         await show_item(q, context, num)
     elif data.startswith("buy_") and num is not None:
@@ -979,6 +1028,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_backup(msg.chat_id, context)
     elif data == "admin_list":
         await show_admin_list(q, context)
+    elif data.startswith("alp_") and num is not None:
+        await show_admin_list(q, context, num)
     elif data == "admin_add":
         context.user_data.clear()
         context.user_data["step"] = "name"
