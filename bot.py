@@ -1,29 +1,42 @@
 import os
 import io
 import json
+import time
 import random
 import sqlite3
 import logging
 import threading
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from html import escape
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+from telegram.error import TelegramError, BadRequest
+from telegram.ext import (
+    Application, ApplicationHandlerStop, CommandHandler, MessageHandler,
+    CallbackQueryHandler, TypeHandler, ContextTypes, filters,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ================= تنظیمات =================
-BOT_TOKEN = "8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk"
+# توکن رو توی محیط (Environment Variable) روی هاستت بذار، نه توی کد
+BOT_TOKEN = os.environ.get("8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk", "")
 ADMIN_ID = 5591238725
-ADMIN_ID_2 = 6270844351  # <<< آیدی عددی ادمین دوم را اینجا وارد کنید
+ADMIN_ID_2 = 6270844351
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
 HOUSE_VALUE = 2500
 REPAIR_COST = 400
+
+# ضد اسپم: بیشتر از RATE_MAX عمل در RATE_WINDOW ثانیه => RATE_BLOCK ثانیه بلاک
+RATE_WINDOW = 10
+RATE_MAX = 8
+RATE_BLOCK = 30
 
 CATEGORIES = {
     "car": "🚗 خودرو",
@@ -34,9 +47,11 @@ CATEGORIES = {
 
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/")
 def home():
     return "Trader Bot is running! 🎮"
+
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
@@ -50,9 +65,9 @@ def db():
     try:
         with conn:
             yield conn
-        conn.commit()
     finally:
         conn.close()
+
 
 def init_db():
     with db() as conn:
@@ -69,21 +84,32 @@ def init_db():
             name TEXT NOT NULL,
             category TEXT NOT NULL,
             buy_price INTEGER NOT NULL,
-            sell_price INTEGER NOT NULL
+            sell_price INTEGER NOT NULL DEFAULT 0
         )""")
+        # مالک هر منو (برای اینکه فقط کسی که منو رو باز کرده بتونه ازش استفاده کنه)
+        conn.execute("""CREATE TABLE IF NOT EXISTS panels (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, message_id)
+        )""")
+        # مهاجرت: اضافه کردن ستون عکس به دیتابیس‌های قدیمی
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+        if "photo_id" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN photo_id TEXT")
+        conn.execute("DELETE FROM panels WHERE created < ?", (int(time.time()) - 7 * 86400,))
 
 
 # ================= ابزارها =================
 def is_admin(uid):
-    return uid == ADMIN_ID or uid == ADMIN_ID_2
+    return uid in (ADMIN_ID, ADMIN_ID_2)
+
 
 def normalize_digits(text):
-    text = str(text)
-    text = text.replace("۰", "0").replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4")
-    text = text.replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9")
-    text = text.replace("٠", "0").replace("١", "1").replace("٢", "2").replace("٣", "3").replace("٤", "4")
-    text = text.replace("٥", "5").replace("٦", "6").replace("٧", "7").replace("٨", "8").replace("٩", "9")
-    return text
+    table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    return str(text).translate(table)
+
 
 def parse_amount(text):
     if not text:
@@ -93,6 +119,7 @@ def parse_amount(text):
         return None
     return int(s)
 
+
 def get_cars(player):
     try:
         data = json.loads(player["cars"] or "[]")
@@ -100,9 +127,16 @@ def get_cars(player):
     except Exception:
         return []
 
+
 def ensure_player(conn, uid, username="player"):
     conn.execute("INSERT OR IGNORE INTO players (user_id, username) VALUES (?,?)", (uid, username))
 
+
+def user_label(user):
+    return user.username or user.first_name or "پلیر"
+
+
+# ---------- کیبوردها ----------
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💼 دارایی‌های من", callback_data="my_assets")],
@@ -111,8 +145,10 @@ def main_menu():
         [InlineKeyboardButton("🎁 جایزه روزانه", callback_data="daily")],
     ])
 
+
 def back_main():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]])
+
 
 def admin_menu():
     return InlineKeyboardMarkup([
@@ -122,16 +158,113 @@ def admin_menu():
         [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
     ])
 
+
+def cancel_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")]])
+
+
+# ---------- مالکیت منوها ----------
+def remember_panel(msg, owner_id):
+    """ثبت اینکه این منو مال کیه (فقط در گروه‌ها لازمه)."""
+    if msg is None or msg.chat.type == "private":
+        return
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO panels (chat_id, message_id, owner_id, created) VALUES (?,?,?,?)",
+            (msg.chat_id, msg.message_id, owner_id, int(time.time())),
+        )
+
+
+def panel_owner(chat_id, message_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT owner_id FROM panels WHERE chat_id=? AND message_id=?", (chat_id, message_id)
+        ).fetchone()
+    return row["owner_id"] if row else None
+
+
+async def reply_panel(update: Update, text, markup=None):
+    sent = await update.effective_message.reply_text(text, reply_markup=markup)
+    remember_panel(sent, update.effective_user.id)
+    return sent
+
+
+async def send_panel(context, chat_id, owner_id, text, markup=None, photo=None):
+    sent = None
+    if photo:
+        try:
+            sent = await context.bot.send_photo(chat_id=chat_id, photo=photo,
+                                                caption=text[:1024], reply_markup=markup)
+        except TelegramError as e:
+            logger.warning("send_photo failed: %s", e)
+    if sent is None:
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    remember_panel(sent, owner_id)
+    return sent
+
+
 async def safe_delete(message):
     try:
         await message.delete()
     except TelegramError:
         pass
 
-async def replace_message(query, context, text, markup=None):
-    chat_id = query.message.chat_id
-    await safe_delete(query.message)
-    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+async def show(query, context, text, markup=None, photo=None):
+    """نمایش صفحه جدید: تا جای ممکن همون پیام ادیت میشه (پیام جدید پایین چت نمیاد)."""
+    msg = query.message
+    if not photo and not msg.photo:
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            logger.warning("edit failed, resending: %s", e)
+        except TelegramError as e:
+            logger.warning("edit failed, resending: %s", e)
+    await safe_delete(msg)
+    await send_panel(context, msg.chat_id, query.from_user.id, text, markup, photo)
+
+
+# ================= ضد اسپم =================
+_hits = {}
+
+
+async def rate_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or is_admin(user.id):
+        return
+    now = time.monotonic()
+    if len(_hits) > 5000:
+        for k in [k for k, v in _hits.items() if now > v["blocked_until"] and not v["times"]]:
+            _hits.pop(k, None)
+    st = _hits.setdefault(user.id, {"times": deque(), "blocked_until": 0.0})
+
+    if now < st["blocked_until"]:
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("⏳ آهسته‌تر! چند ثانیه صبر کن.")
+            except TelegramError:
+                pass
+        raise ApplicationHandlerStop
+
+    times = st["times"]
+    while times and now - times[0] > RATE_WINDOW:
+        times.popleft()
+    times.append(now)
+
+    if len(times) > RATE_MAX:
+        st["blocked_until"] = now + RATE_BLOCK
+        times.clear()
+        try:
+            if update.callback_query:
+                await update.callback_query.answer(f"⏳ اسپم نکن! {RATE_BLOCK} ثانیه بلاکی.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(f"⏳ اسپم نکن! {RATE_BLOCK} ثانیه نمی‌تونی استفاده کنی.")
+        except TelegramError:
+            pass
+        raise ApplicationHandlerStop
 
 
 # ================= منوی پلیر =================
@@ -139,22 +272,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid = update.effective_user.id
-    name = update.effective_user.username or update.effective_user.first_name or "پلیر"
+    name = user_label(update.effective_user)
     with db() as conn:
         ensure_player(conn, uid, name)
         conn.execute("UPDATE players SET username=? WHERE user_id=?", (name, uid))
-    await update.message.reply_text(
-        f"🎮 به تریدر (Trader) خوش آمدی {name}!\n\nاز منوی زیر استفاده کن:",
-        reply_markup=main_menu()
-    )
+    await reply_panel(update, f"🎮 به تریدر (Trader) خوش آمدی {name}!\n\nاز منوی زیر استفاده کن:", main_menu())
+
 
 def asset_text(conn, player):
     cars = get_cars(player)
     car_value = 0
     for name in cars:
         row = conn.execute(
-            "SELECT buy_price FROM items WHERE name=? AND category='car' ORDER BY id LIMIT 1",
-            (name,)
+            "SELECT buy_price FROM items WHERE name=? AND category='car' ORDER BY id LIMIT 1", (name,)
         ).fetchone()
         if row:
             car_value += row["buy_price"]
@@ -171,36 +301,37 @@ def asset_text(conn, player):
         f"💎 کل دارایی: {total:,} $"
     )
 
+
 async def show_assets(query, context):
-    uid = query.from_user.id
     with db() as conn:
-        player = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        player = conn.execute("SELECT * FROM players WHERE user_id=?", (query.from_user.id,)).fetchone()
         text = asset_text(conn, player) if player else "❌ اول /start بزن تا ثبت‌نام بشی."
-    await replace_message(query, context, text, back_main())
+    await show(query, context, text, back_main())
+
 
 async def show_shop(query, context):
     with db() as conn:
         rows = conn.execute("SELECT DISTINCT category FROM items ORDER BY category").fetchall()
     if not rows:
-        await replace_message(query, context, "🛒 فروشگاه فعلاً خالی است.", back_main())
+        await show(query, context, "🛒 فروشگاه فعلاً خالی است.", back_main())
         return
     keyboard = [[InlineKeyboardButton(CATEGORIES.get(r["category"], r["category"]),
                                      callback_data="cat_" + r["category"])] for r in rows]
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
-    await replace_message(query, context, "🛒 فروشگاه تریدر\n\nیک دسته رو انتخاب کن:",
-                          InlineKeyboardMarkup(keyboard))
+    await show(query, context, "🛒 فروشگاه تریدر\n\nیک دسته رو انتخاب کن:", InlineKeyboardMarkup(keyboard))
+
 
 async def show_category(query, context, category):
     with db() as conn:
         items = conn.execute("SELECT * FROM items WHERE category=? ORDER BY id", (category,)).fetchall()
     if not items:
-        await replace_message(query, context, "📦 این دسته فعلاً خالی است.", back_main())
+        await show(query, context, "📦 این دسته فعلاً خالی است.", back_main())
         return
-    keyboard = []
-    row = []
+    keyboard, row = [], []
     for it in items:
-        label = f"{it['name']} | {it['buy_price']:,}$"
-        row.append(InlineKeyboardButton(label[:48], callback_data="buy_" + str(it["id"])))
+        icon = "🖼 " if it["photo_id"] else ""
+        label = f"{icon}{it['name']} | {it['buy_price']:,}$"
+        row.append(InlineKeyboardButton(label[:48], callback_data="pick_" + str(it["id"])))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -208,66 +339,94 @@ async def show_category(query, context, category):
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 دسته‌بندی‌ها", callback_data="shop")])
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
-    await replace_message(query, context,
-                          f"{CATEGORIES.get(category, category)}\n\nبرای خرید روی آیتم بزن:",
-                          InlineKeyboardMarkup(keyboard))
+    await show(query, context, f"{CATEGORIES.get(category, category)}\n\nیک آیتم رو انتخاب کن:",
+               InlineKeyboardMarkup(keyboard))
 
-async def buy_item(query, context, item_id):
-    uid = query.from_user.id
-    username = query.from_user.username or query.from_user.first_name or "ناشناس"
-    
+
+async def show_item(query, context, item_id):
     with db() as conn:
+        it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not it:
+        await show(query, context, "❌ آیتم پیدا نشد.", back_main())
+        return
+    text = (
+        f"📛 {it['name']}\n"
+        f"🏷️ دسته: {CATEGORIES.get(it['category'], it['category'])}\n"
+        f"💵 قیمت: {it['buy_price']:,} $"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🛒 خرید ({it['buy_price']:,}$)", callback_data="buy_" + str(it["id"]))],
+        [InlineKeyboardButton("🔙 برگشت", callback_data="cat_" + it["category"]),
+         InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
+    ])
+    await show(query, context, text, markup, photo=it["photo_id"])
+
+
+def try_buy(uid, item_id):
+    """خرید اتمیک. خروجی: (وضعیت, آیتم, موجودی)"""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item:
-            await replace_message(query, context, "❌ آیتم پیدا نشد.", back_main())
-            return
+            return "no_item", None, 0
         player = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
         if not player:
-            await replace_message(query, context, "❌ اول /start بزن.", back_main())
-            return
+            return "no_player", item, 0
         cars = get_cars(player)
         if item["category"] == "car" and len(cars) >= MAX_CARS:
-            await replace_message(query, context, f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.", back_main())
-            return
+            return "car_full", item, player["cash"]
         if player["cash"] < item["buy_price"]:
-            await replace_message(query, context, f"❌ پولت کمه!\n💰 داری: {player['cash']:,} $\n💵 نیاز داری: {item['buy_price']:,} $", back_main())
-            return
-        cur = conn.execute(
-            "UPDATE players SET cash=cash-? WHERE user_id=? AND cash>=?",
-            (item["buy_price"], uid, item["buy_price"])
-        )
-        if cur.rowcount != 1:
-            await replace_message(query, context, "❌ موجودی کافی نیست.", back_main())
-            return
+            return "poor", item, player["cash"]
+        conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (item["buy_price"], uid))
         if item["category"] == "car":
             cars.append(item["name"])
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), uid))
-    
+        return "ok", item, player["cash"] - item["buy_price"]
+
+
+async def buy_item(query, context, item_id):
+    user = query.from_user
+    status, item, cash = try_buy(user.id, item_id)
+
+    if status == "no_item":
+        await show(query, context, "❌ آیتم پیدا نشد.", back_main())
+        return
+    if status == "no_player":
+        await show(query, context, "❌ اول /start بزن.", back_main())
+        return
+    if status == "car_full":
+        await show(query, context, f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.", back_main())
+        return
+    if status == "poor":
+        await show(query, context,
+                   f"❌ پولت کمه!\n💰 داری: {cash:,} $\n💵 نیاز داری: {item['buy_price']:,} $", back_main())
+        return
+
+    uname = f"@{escape(user.username)}" if user.username else "ندارد"
     admin_msg = (
-        f"🛒 **سفارش جدید!**\n\n"
-        f"👤 پلیر: {username}\n"
-        f"🆔 آیدی: `{uid}`\n"
-        f"📦 آیتم: {item['name']}\n"
+        f"🛒 <b>سفارش جدید!</b>\n\n"
+        f"👤 نام: <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a>\n"
+        f"🔗 یوزرنیم: {uname}\n"
+        f"🆔 آیدی: <code>{user.id}</code>\n"
+        f"📦 آیتم: {escape(item['name'])}\n"
         f"🏷️ دسته: {CATEGORIES.get(item['category'], item['category'])}\n"
         f"💰 قیمت: {item['buy_price']:,} $\n\n"
         f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
-    
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Failed to send admin notification: {e}")
-        
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID_2, text=admin_msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Failed to send admin notification to second admin: {e}")
+    for admin in (ADMIN_ID, ADMIN_ID_2):
+        try:
+            if item["photo_id"]:
+                await context.bot.send_photo(chat_id=admin, photo=item["photo_id"],
+                                             caption=admin_msg, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=admin, text=admin_msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error("Failed to notify admin %s: %s", admin, e)
 
-    await replace_message(
-        query, context,
-        f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n📦 برای تحویل گرفتن به ادمین سرور پیام بده.",
-        back_main()
-    )
+    await show(query, context,
+               f"✅ {item['name']} خریدی!\n💰 {item['buy_price']:,} $ کسر شد.\n"
+               f"📦 برای تحویل گرفتن به ادمین سرور پیام بده.", back_main())
+
 
 async def show_leaderboard(query, context):
     with db() as conn:
@@ -278,7 +437,8 @@ async def show_leaderboard(query, context):
         text = "🏆 ثروتمندترین‌های گریم ولی:\n\n" + "\n".join(
             f"{i}. {r['username'] or 'پلیر'} — {r['cash']:,} $" for i, r in enumerate(rows, 1)
         )
-    await replace_message(query, context, text, back_main())
+    await show(query, context, text, back_main())
+
 
 async def give_daily(query, context):
     uid = query.from_user.id
@@ -286,119 +446,134 @@ async def give_daily(query, context):
     with db() as conn:
         player = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
         if not player:
-            await replace_message(query, context, "❌ اول /start بزن.", back_main())
-            return
-        if player["last_daily"] == today:
+            text = "❌ اول /start بزن."
+        elif player["last_daily"] == today:
             text = "❌ امروز جایزه‌ات رو گرفتی.\nفردا دوباره بیا!"
         else:
             reward = random.randint(20, 40)
-            conn.execute("UPDATE players SET cash=cash+?, last_daily=? WHERE user_id=?",
-                         (reward, today, uid))
+            conn.execute("UPDATE players SET cash=cash+?, last_daily=? WHERE user_id=?", (reward, today, uid))
             text = f"🎁 جایزه روزانه: {reward} $\n✅ به حسابت اضافه شد."
-    await replace_message(query, context, text, back_main())
+    await show(query, context, text, back_main())
 
 
-# ================= افزودن آیتم =================
+# ================= افزودن / ویرایش آیتم (ادمین) =================
+ADD_NAME_PROMPT = "✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van"
+
+
 async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط ادمین.")
         return
     context.user_data.clear()
-    context.user_data["step"] = 1
-    await update.message.reply_text("✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
+    context.user_data["step"] = "name"
+    await reply_panel(update, ADD_NAME_PROMPT, cancel_markup())
 
-async def handle_text_for_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+
+async def finish_add(context, chat_id, owner_id, photo_id):
+    ud = context.user_data
+    name, buy, category = ud.get("item_name"), ud.get("item_buy"), ud.get("item_cat")
+    if not (name and buy and category):
+        ud.clear()
+        await send_panel(context, chat_id, owner_id, "❌ اطلاعات ناقص بود. دوباره شروع کن.", admin_menu())
         return
-    step = context.user_data.get("step")
-    if not step:
-        return
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO items (name, category, buy_price, sell_price, photo_id) VALUES (?,?,?,0,?)",
+            (name, category, buy, photo_id),
+        )
+        new_id = cur.lastrowid
+    ud.clear()
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
+        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
+    ])
+    text = (f"✅ آیتم ثبت شد!\n\n🆔 کد: {new_id}\n📛 اسم: {name}\n"
+            f"🏷️ دسته: {CATEGORIES[category]}\n💵 قیمت: {buy:,} $\n🖼 عکس: {'دارد' if photo_id else 'ندارد'}")
+    await send_panel(context, chat_id, owner_id, text, markup, photo=photo_id)
+
+
+async def handle_admin_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
     text = update.message.text.strip()
+    step, edit_step = ud.get("step"), ud.get("edit_step")
     try:
-        if step == 1:
+        if step == "name":
             if not text or len(text) > 60:
-                await update.message.reply_text("❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.")
+                await reply_panel(update, "❌ یه اسم معتبر (حداکثر ۶۰ حرف) بنویس.", cancel_markup())
                 return
-            context.user_data["item_name"] = text
-            context.user_data["step"] = 2
-            await update.message.reply_text("✏️ مرحله ۲ از ۴:\nقیمت خرید رو فقط عدد بنویس:\nمثال: 1500")
-        elif step == 2:
+            ud["item_name"] = text
+            ud["step"] = "price"
+            await reply_panel(update, "✏️ مرحله ۲ از ۴:\nقیمت رو فقط عدد بنویس:\nمثال: 1500", cancel_markup())
+        elif step == "price":
             value = parse_amount(text)
             if value is None or value <= 0:
-                await update.message.reply_text("❌ یه عدد مثبت بنویس. مثال: 1500")
+                await reply_panel(update, "❌ یه عدد مثبت بنویس. مثال: 1500", cancel_markup())
                 return
-            context.user_data["item_buy"] = value
-            context.user_data["step"] = 3
-            await update.message.reply_text("✏️ مرحله ۳ از ۴:\nقیمت فروش رو فقط عدد بنویس:\nمثال: 600")
-        elif step == 3:
+            ud["item_buy"] = value
+            ud["step"] = "category"
+            kb = [[InlineKeyboardButton(label, callback_data="addcat_" + key)] for key, label in CATEGORIES.items()]
+            kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")])
+            await reply_panel(update, "✏️ مرحله ۳ از ۴:\nدسته‌بندی رو انتخاب کن:", InlineKeyboardMarkup(kb))
+        elif step in ("category", "photo"):
+            await reply_panel(update, "👆 از دکمه‌های همین مرحله استفاده کن"
+                              + (" یا عکس بفرست." if step == "photo" else "."), cancel_markup())
+        elif edit_step == "edit_price":
             value = parse_amount(text)
-            if value is None or value < 0:
-                await update.message.reply_text("❌ یه عدد معتبر بنویس. مثال: 600")
+            if value is None or value <= 0:
+                await reply_panel(update, "❌ یه عدد معتبر بنویس.", cancel_markup())
                 return
-            context.user_data["item_sell"] = value
-            context.user_data["step"] = 4
-            await update.message.reply_text("✏️ مرحله ۴ از ۴:\nدسته‌بندی رو بنویس:\n\ncar → خودرو\nresource → منابع\nattachment → باربند")
-        elif step == 4:
-            raw = text.lower()
-            mapping = {"car": "car", "خودرو": "car", "ماشین": "car", "resource": "resource", "منبع": "resource", "منابع": "resource", "attachment": "attachment", "باربند": "attachment"}
-            category = mapping.get(raw)
-            if not category:
-                await update.message.reply_text("❌ فقط car یا resource یا attachment بنویس.")
-                return
-            
-            name = context.user_data.get("item_name")
-            buy = context.user_data.get("item_buy")
-            sell = context.user_data.get("item_sell")
-            
             with db() as conn:
-                cur = conn.execute("INSERT INTO items (name, category, buy_price, sell_price) VALUES (?,?,?,?)", (name, category, buy, sell))
-                new_id = cur.lastrowid
-            
-            context.user_data.clear()
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 لیست آیتم‌ها", callback_data="admin_list")],
-                [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
-            ])
-            caption = f"✅ آیتم ثبت شد!\n\n🆔 کد: {new_id}\n📛 اسم: {name}\n🏷️ دسته: {CATEGORIES[category]}\n💵 خرید: {buy:,} $\n♻️ فروش: {sell:,} $"
-            await update.message.reply_text(caption, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Error in handle_text_for_add: {e}", exc_info=True)
-        await update.message.reply_text(f"⚠️ خطا: {str(e)}")
-
-
-# ================= ویرایش آیتم =================
-async def handle_text_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    edit_step = context.user_data.get("edit_step")
-    if not edit_step:
-        return
-    text = update.message.text.strip()
-    try:
-        if edit_step == "edit_price":
-            value = parse_amount(text)
-            if value is None or value < 0:
-                await update.message.reply_text("❌ یه عدد معتبر بنویس.")
-                return
-            field = context.user_data.get("edit_field")
-            item_id = context.user_data.get("edit_id")
-            with db() as conn:
-                conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
-            context.user_data.clear()
-            label = "قیمت خرید" if field == "buy_price" else "قیمت فروش"
-            await update.message.reply_text(f"✅ {label} به {value:,} $ تغییر کرد.")
+                conn.execute("UPDATE items SET buy_price=? WHERE id=?", (value, ud.get("edit_id")))
+            item_id = ud.get("edit_id")
+            ud.clear()
+            await reply_panel(update, f"✅ قیمت به {value:,} $ تغییر کرد.", item_back_markup(item_id))
         elif edit_step == "edit_name":
             if not text or len(text) > 60:
-                await update.message.reply_text("❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).")
+                await reply_panel(update, "❌ اسم معتبر بنویس (حداکثر ۶۰ حرف).", cancel_markup())
                 return
-            item_id = context.user_data.get("edit_id")
+            item_id = ud.get("edit_id")
             with db() as conn:
                 conn.execute("UPDATE items SET name=? WHERE id=?", (text, item_id))
-            context.user_data.clear()
-            await update.message.reply_text(f"✅ اسم به «{text}» تغییر کرد.")
+            ud.clear()
+            await reply_panel(update, f"✅ اسم به «{text}» تغییر کرد.", item_back_markup(item_id))
+        elif edit_step == "edit_photo":
+            await reply_panel(update, "🖼 یه عکس بفرست (نه متن).", cancel_markup())
     except Exception as e:
-        logger.error(f"Error in handle_text_for_edit: {e}", exc_info=True)
-        await update.message.reply_text(f"⚠️ خطا: {str(e)}")
+        logger.error("Error in admin flow: %s", e, exc_info=True)
+        await update.message.reply_text("⚠️ خطایی پیش اومد. دوباره تلاش کن.")
+
+
+def item_back_markup(item_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 صفحه آیتم", callback_data="item_" + str(item_id)),
+         InlineKeyboardButton("📋 لیست", callback_data="admin_list")],
+    ])
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id) or not update.message or not update.message.photo:
+        return
+    ud = context.user_data
+    file_id = update.message.photo[-1].file_id
+    if ud.get("step") == "photo":
+        await finish_add(context, update.effective_chat.id, user.id, file_id)
+    elif ud.get("edit_step") == "edit_photo":
+        item_id = ud.get("edit_id")
+        with db() as conn:
+            conn.execute("UPDATE items SET photo_id=? WHERE id=?", (file_id, item_id))
+        ud.clear()
+        await reply_panel(update, "✅ عکس آیتم تغییر کرد.", item_back_markup(item_id))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنها هندلر متن: اول فلو افزودن/ویرایش، بعد دستورات ریپلای ادمین."""
+    if not update.message or not update.message.text or not is_admin(update.effective_user.id):
+        return
+    if context.user_data.get("step") or context.user_data.get("edit_step"):
+        await handle_admin_flow(update, context)
+    elif update.message.reply_to_message:
+        await admin_reply(update, context)
 
 
 # ================= پنل ادمین: لیست / جزئیات / حذف =================
@@ -416,65 +591,71 @@ def build_item_list(items):
     keyboard.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")])
     return "📋 لیست آیتم‌ها — برای ویرایش روی یک آیتم بزن:", InlineKeyboardMarkup(keyboard)
 
+
 async def cmd_list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     with db() as conn:
         items = conn.execute("SELECT * FROM items ORDER BY id").fetchall()
     if not items:
-        await update.message.reply_text("📋 فروشگاه خالی است.\nبا /additem آیتم اضافه کن.")
+        await reply_panel(update, "📋 فروشگاه خالی است.", admin_menu())
         return
     text, markup = build_item_list(items)
-    await update.message.reply_text(text, reply_markup=markup)
+    await reply_panel(update, text, markup)
+
 
 async def show_admin_list(query, context):
     with db() as conn:
         items = conn.execute("SELECT * FROM items ORDER BY id").fetchall()
     if not items:
-        await replace_message(query, context, "📋 فروشگاه خالی است.\nبرای افزودن دکمه زیر رو بزن.", admin_menu())
+        await show(query, context, "📋 فروشگاه خالی است.\nبرای افزودن دکمه زیر رو بزن.", admin_menu())
         return
     text, markup = build_item_list(items)
-    await replace_message(query, context, text, markup)
+    await show(query, context, text, markup)
+
 
 async def show_item_detail(query, context, item_id):
     with db() as conn:
         it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     if not it:
-        await replace_message(query, context, "❌ آیتم پیدا نشد.", admin_menu())
+        await show(query, context, "❌ آیتم پیدا نشد.", admin_menu())
         return
     text = (
         f"🆔 کد: {it['id']}\n"
         f"📛 اسم: {it['name']}\n"
         f"🏷️ دسته: {CATEGORIES.get(it['category'], it['category'])}\n"
-        f"💵 قیمت خرید: {it['buy_price']:,} $\n"
-        f"♻️ قیمت فروش: {it['sell_price']:,} $"
+        f"💵 قیمت: {it['buy_price']:,} $\n"
+        f"🖼 عکس: {'دارد' if it['photo_id'] else 'ندارد'}"
     )
+    i = str(it["id"])
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ قیمت خرید", callback_data="eb_" + str(it["id"])),
-         InlineKeyboardButton("✏️ قیمت فروش", callback_data="es_" + str(it["id"]))],
-        [InlineKeyboardButton("✏️ اسم", callback_data="en_" + str(it["id"]))],
-        [InlineKeyboardButton("🗑️ حذف آیتم", callback_data="del_" + str(it["id"]))],
+        [InlineKeyboardButton("✏️ قیمت", callback_data="eb_" + i),
+         InlineKeyboardButton("✏️ اسم", callback_data="en_" + i)],
+        [InlineKeyboardButton("🖼 تغییر عکس", callback_data="ep_" + i)],
+        [InlineKeyboardButton("🗑️ حذف آیتم", callback_data="del_" + i)],
         [InlineKeyboardButton("📋 لیست", callback_data="admin_list"),
          InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
     ])
-    await replace_message(query, context, text, markup)
+    await show(query, context, text, markup, photo=it["photo_id"])
+
 
 async def confirm_delete(query, context, item_id):
     with db() as conn:
         it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     if not it:
-        await replace_message(query, context, "❌ آیتم پیدا نشد.", admin_menu())
+        await show(query, context, "❌ آیتم پیدا نشد.", admin_menu())
         return
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ بله، حذف کن", callback_data="delyes_" + str(item_id)),
          InlineKeyboardButton("❌ نه", callback_data="item_" + str(item_id))],
     ])
-    await replace_message(query, context, f"⚠️ مطمئنی «{it['name']}» حذف بشه؟\nاین کار برگشت‌پذیر نیست.", markup)
+    await show(query, context, f"⚠️ مطمئنی «{it['name']}» حذف بشه؟\nاین کار برگشت‌پذیر نیست.", markup)
+
 
 async def do_delete(query, context, item_id):
     with db() as conn:
         conn.execute("DELETE FROM items WHERE id=?", (item_id,))
-    await replace_message(query, context, "🗑️ آیتم حذف شد.", admin_menu())
+    await show(query, context, "🗑️ آیتم حذف شد.", admin_menu())
 
 
 # ================= دستورات ادمین با ریپلای =================
@@ -482,96 +663,98 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ دسترسی غیرمجاز.")
         return
-    await update.message.reply_text("🛠️ پنل مدیریت تریدر:", reply_markup=admin_menu())
+    await reply_panel(update, "🛠️ پنل مدیریت تریدر:", admin_menu())
 
-async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    msg = update.message
-    if not msg or not msg.reply_to_message or not msg.text:
-        return
-    target = msg.reply_to_message.from_user.id
-    target_name = msg.reply_to_message.from_user.username or msg.reply_to_message.from_user.first_name or "player"
-    text = msg.text.strip()
-    if not text:
-        return
+
+def apply_admin_command(target, target_name, text):
+    """اجرای دستور ریپلای. متن جواب رو برمی‌گردونه (یا None اگه دستور نبود)."""
     low = text.lower()
+    if not (text[0] in "+-" or low in ("repair", "تعمیر")):
+        return None
 
     with db() as conn:
         ensure_player(conn, target, target_name)
+
         if low in ("+house", "+خونه", "+خانه"):
             conn.execute("UPDATE players SET has_house=1 WHERE user_id=?", (target,))
-            await msg.reply_text("✅ خانه ثبت شد.")
-            return
+            return "✅ خانه ثبت شد."
         if low in ("-house", "-خونه", "-خانه"):
             conn.execute("UPDATE players SET has_house=0 WHERE user_id=?", (target,))
-            await msg.reply_text("✅ خانه حذف شد.")
-            return
+            return "✅ خانه حذف شد."
         if low in ("repair", "تعمیر", "+repair"):
-            player = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()
-            if player["cash"] < REPAIR_COST:
-                await msg.reply_text(f"❌ پولش برای تعمیر ({REPAIR_COST} $) کافی نیست.")
-                return
+            cash = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()["cash"]
+            if cash < REPAIR_COST:
+                return f"❌ پولش برای تعمیر ({REPAIR_COST} $) کافی نیست."
             conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (REPAIR_COST, target))
-            await msg.reply_text(f"🔧 هزینه تعمیر: {REPAIR_COST} $ کم شد.")
-            return
+            return f"🔧 هزینه تعمیر: {REPAIR_COST} $ کم شد."
+
         if low.startswith("+car ") or low.startswith("+ماشین "):
             name = text.split(" ", 1)[1].strip()
+            if not name:
+                return "❌ اسم ماشین رو بنویس."
             row = conn.execute("SELECT cars FROM players WHERE user_id=?", (target,)).fetchone()
             cars = get_cars(row)
             if len(cars) >= MAX_CARS:
-                await msg.reply_text(f"❌ سقف {MAX_CARS} ماشین پر شده!")
-                return
+                return f"❌ سقف {MAX_CARS} ماشین پر شده!"
             cars.append(name)
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), target))
-            await msg.reply_text(f"✅ {name} اضافه شد. ({len(cars)}/{MAX_CARS})")
-            return
+            return f"✅ {name} اضافه شد. ({len(cars)}/{MAX_CARS})"
+
         if low.startswith("-car") or low.startswith("-ماشین"):
             parts = text.split(" ", 1)
             name = parts[1].strip() if len(parts) > 1 else ""
             row = conn.execute("SELECT cars FROM players WHERE user_id=?", (target,)).fetchone()
             cars = get_cars(row)
             if not cars:
-                await msg.reply_text("❌ این پلیر ماشینی نداره.")
-                return
+                return "❌ این پلیر ماشینی نداره."
             if name:
                 found = next((i for i, c in enumerate(cars) if c.lower() == name.lower()), None)
                 if found is None:
-                    await msg.reply_text("❌ این ماشین توی لیستش نیست.\nلیستش:\n" + "\n".join(f"• {c}" for c in cars))
-                    return
+                    return "❌ این ماشین توی لیستش نیست.\nلیستش:\n" + "\n".join(f"• {c}" for c in cars)
                 removed = cars.pop(found)
             else:
                 removed = cars.pop()
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), target))
-            await msg.reply_text(f"✅ {removed} حذف شد. ({len(cars)}/{MAX_CARS} باقی‌مانده)")
-            return
-        if len(text) >= 2 and text[0] in "+-":
+            return f"✅ {removed} حذف شد. ({len(cars)}/{MAX_CARS} باقی‌مانده)"
+
+        if len(text) >= 2:
             amount = parse_amount(text[1:])
             if amount is None or amount <= 0:
-                await msg.reply_text("❌ عدد معتبر بنویس. مثال: +200")
-                return
-            player = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()
+                return "❌ عدد معتبر بنویس. مثال: +200"
+            cash = conn.execute("SELECT cash FROM players WHERE user_id=?", (target,)).fetchone()["cash"]
             if text[0] == "+":
                 conn.execute("UPDATE players SET cash=cash+? WHERE user_id=?", (amount, target))
-                await msg.reply_text(f"✅ {amount:,} $ اضافه شد.\n💰 موجودی جدید: {player['cash'] + amount:,} $")
-            else:
-                if player["cash"] < amount:
-                    await msg.reply_text(f"❌ اینقدر پول نداره! موجودیش: {player['cash']:,} $")
-                    return
-                conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (amount, target))
-                await msg.reply_text(f"✅ {amount:,} $ کم شد.\n💰 موجودی جدید: {player['cash'] - amount:,} $")
-            return
+                return f"✅ {amount:,} $ اضافه شد.\n💰 موجودی جدید: {cash + amount:,} $"
+            if cash < amount:
+                return f"❌ اینقدر پول نداره! موجودیش: {cash:,} $"
+            conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (amount, target))
+            return f"✅ {amount:,} $ کم شد.\n💰 موجودی جدید: {cash - amount:,} $"
+    return None
+
+
+async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    replied = msg.reply_to_message
+    if not replied or not replied.from_user:
+        return
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    result = apply_admin_command(replied.from_user.id, user_label(replied.from_user), text)
+    if result:
+        await msg.reply_text(result)
+
 
 async def wealth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ دسترسی غیرمجاز.")
         return
-    if not update.message.reply_to_message:
+    replied = update.message.reply_to_message
+    if not replied or not replied.from_user:
         await update.message.reply_text("❌ روی پیام پلیر ریپلای کن و /wealth بزن.")
         return
-    target = update.message.reply_to_message.from_user.id
     with db() as conn:
-        player = conn.execute("SELECT * FROM players WHERE user_id=?", (target,)).fetchone()
+        player = conn.execute("SELECT * FROM players WHERE user_id=?", (replied.from_user.id,)).fetchone()
         if not player:
             await update.message.reply_text("❌ این پلیر ثبت‌نام نکرده. اول ازش بخواه /start بزنه.")
             return
@@ -588,10 +771,12 @@ async def send_backup(chat_id, context):
         caption="💾 بکاپ کامل تریدر\n\nاین فایل رو نگه دار.\nبرای برگرداندنش، روی همین فایل ریپلای کن و /restore بزن."
     )
 
+
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     await send_backup(update.effective_message.chat_id, context)
+
 
 async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -604,7 +789,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (doc.file_name or "").endswith(".db"):
         await msg.reply_text("❌ فایل باید پسوند .db داشته باشه.")
         return
-    if doc.file_size > 20 * 1024 * 1024:
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await msg.reply_text("❌ فایل خیلی حجیمه.")
         return
     tmp = "restore_tmp.db"
@@ -612,13 +797,16 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(custom_path=tmp)
         check = sqlite3.connect(tmp)
-        check.execute("SELECT COUNT(*) FROM players").fetchone()
-        check.execute("SELECT COUNT(*) FROM items").fetchone()
-        ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        check.close()
+        try:
+            check.execute("SELECT COUNT(*) FROM players").fetchone()
+            check.execute("SELECT COUNT(*) FROM items").fetchone()
+            ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            check.close()
         if not ok:
             raise ValueError("invalid database")
         os.replace(tmp, DB_FILE)
+        init_db()  # اگه بکاپ قدیمی بود، ستون‌های جدید اضافه میشه
         await msg.reply_text("✅ بکاپ بازیابی شد. همه پول‌ها، ماشین‌ها و آیتم‌ها برگشتن.")
     except Exception as e:
         logger.error("Restore failed: %s", e)
@@ -629,19 +817,39 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= لغو =================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ لغو شد.")
+    # فقط وقتی واقعاً عملیاتی در جریانه جواب بده
+    if context.user_data:
+        context.user_data.clear()
+        await update.message.reply_text("❌ عملیات لغو شد.")
 
 
 # ================= دیسپچر دکمه‌ها =================
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    data = q.data or ""
+    msg = q.message
+    if msg is None:
+        await q.answer()
+        return
     uid = q.from_user.id
 
+    # فقط صاحب منو می‌تونه دکمه‌هاش رو بزنه (توی گروه)
+    if msg.chat.type != "private":
+        owner = panel_owner(msg.chat_id, msg.message_id)
+        if owner is None:
+            await q.answer("⌛ این منو قدیمی شده. دوباره /start بزن.", show_alert=True)
+            return
+        if owner != uid:
+            await q.answer("🚫 این منو برای تو نیست. برای خودت /start بزن.", show_alert=True)
+            return
+    await q.answer()
+
+    data = q.data or ""
+    admin = is_admin(uid)
+    num = data.split("_", 1)[1] if "_" in data else ""
+    num = int(num) if num.isdigit() else None
+
     if data == "main_menu":
-        await replace_message(q, context, "🎮 تریدر | منوی اصلی", main_menu())
+        await show(q, context, "🎮 تریدر | منوی اصلی", main_menu())
     elif data == "my_assets":
         await show_assets(q, context)
     elif data == "shop":
@@ -652,53 +860,57 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await give_daily(q, context)
     elif data.startswith("cat_"):
         await show_category(q, context, data[4:])
-    elif data.startswith("buy_"):
-        raw = data[4:]
-        if raw.isdigit():
-            await buy_item(q, context, int(raw))
+    elif data.startswith("pick_") and num is not None:
+        await show_item(q, context, num)
+    elif data.startswith("buy_") and num is not None:
+        await buy_item(q, context, num)
+
+    # ----- ادمین -----
+    elif not admin:
+        return
+    elif data == "cancel_flow":
+        context.user_data.clear()
+        await show(q, context, "❌ عملیات لغو شد.\n\n🛠️ پنل مدیریت تریدر:", admin_menu())
     elif data == "admin_backup":
-        if is_admin(uid):
-            await send_backup(q.message.chat_id, context)
+        await send_backup(msg.chat_id, context)
     elif data == "admin_list":
-        if is_admin(uid):
-            await show_admin_list(q, context)
+        await show_admin_list(q, context)
     elif data == "admin_add":
-        if is_admin(uid):
-            context.user_data.clear()
-            context.user_data["step"] = 1
-            await replace_message(q, context, "✏️ مرحله ۱ از ۴:\nاسم آیتم رو بنویس:\nمثال: Chevy Step Van\n\n(لغو با /cancel)")
-    elif data.startswith("item_"):
-        if is_admin(uid) and data[5:].isdigit():
-            await show_item_detail(q, context, int(data[5:]))
-    elif data.startswith("delyes_"):
-        if is_admin(uid) and data[7:].isdigit():
-            await do_delete(q, context, int(data[7:]))
-    elif data.startswith("del_"):
-        if is_admin(uid) and data[4:].isdigit():
-            await confirm_delete(q, context, int(data[4:]))
-    elif data.startswith("eb_"):
-        if is_admin(uid):
-            parts = data.split("_")
-            context.user_data.clear()
-            context.user_data["edit_step"] = "edit_price"
-            context.user_data["edit_field"] = "buy_price"
-            context.user_data["edit_id"] = int(parts[1])
-            await replace_message(q, context, "💵 قیمت خرید جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
-    elif data.startswith("es_"):
-        if is_admin(uid):
-            parts = data.split("_")
-            context.user_data.clear()
-            context.user_data["edit_step"] = "edit_price"
-            context.user_data["edit_field"] = "sell_price"
-            context.user_data["edit_id"] = int(parts[1])
-            await replace_message(q, context, "💵 قیمت فروش جدید رو فقط عدد بنویس:\n(لغو با /cancel)")
-    elif data.startswith("en_"):
-        if is_admin(uid):
-            parts = data.split("_")
-            context.user_data.clear()
-            context.user_data["edit_step"] = "edit_name"
-            context.user_data["edit_id"] = int(parts[1])
-            await replace_message(q, context, "✏️ اسم جدید آیتم رو بنویس:\n(لغو با /cancel)")
+        context.user_data.clear()
+        context.user_data["step"] = "name"
+        await show(q, context, ADD_NAME_PROMPT, cancel_markup())
+    elif data.startswith("addcat_"):
+        cat = data[7:]
+        if context.user_data.get("step") == "category" and cat in CATEGORIES:
+            context.user_data["item_cat"] = cat
+            context.user_data["step"] = "photo"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ بدون عکس", callback_data="add_skip_photo")],
+                [InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")],
+            ])
+            await show(q, context, "🖼 مرحله ۴ از ۴:\nیه عکس برای آیتم بفرست (اختیاریه):", kb)
+    elif data == "add_skip_photo":
+        if context.user_data.get("step") == "photo":
+            await safe_delete(msg)
+            await finish_add(context, msg.chat_id, uid, None)
+    elif data.startswith("item_") and num is not None:
+        await show_item_detail(q, context, num)
+    elif data.startswith("delyes_") and num is not None:
+        await do_delete(q, context, num)
+    elif data.startswith("del_") and num is not None:
+        await confirm_delete(q, context, num)
+    elif data.startswith("eb_") and num is not None:
+        context.user_data.clear()
+        context.user_data.update(edit_step="edit_price", edit_id=num)
+        await show(q, context, "💵 قیمت جدید رو فقط عدد بنویس:", cancel_markup())
+    elif data.startswith("en_") and num is not None:
+        context.user_data.clear()
+        context.user_data.update(edit_step="edit_name", edit_id=num)
+        await show(q, context, "✏️ اسم جدید آیتم رو بنویس:", cancel_markup())
+    elif data.startswith("ep_") and num is not None:
+        context.user_data.clear()
+        context.user_data.update(edit_step="edit_photo", edit_id=num)
+        await show(q, context, "🖼 عکس جدید آیتم رو بفرست:", cancel_markup())
 
 
 # ================= خطاها =================
@@ -706,36 +918,38 @@ async def on_error(update, context):
     logger.error("Update caused error: %s", context.error, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            error_msg = str(context.error)[:300]
-            await update.effective_message.reply_text(f"⚠️ خطا:\n{error_msg}")
+            await update.effective_message.reply_text("⚠️ یه مشکلی پیش اومد. دوباره تلاش کن.")
         except TelegramError:
             pass
 
 
 # ================= اجرا =================
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN تنظیم نشده. اون رو به‌عنوان Environment Variable بذار.")
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("additem", additem_start))
-    application.add_handler(CommandHandler("listitems", cmd_list_items))
-    application.add_handler(CommandHandler("wealth", wealth_command))
-    application.add_handler(CommandHandler("backup", cmd_backup))
-    application.add_handler(CommandHandler("restore", restore_backup))
-    application.add_handler(CommandHandler("cancel", cancel))
-    
-    application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, admin_reply))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_add))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_edit))
-    
-    application.add_handler(CallbackQueryHandler(on_button))
-    application.add_error_handler(on_error)
-    
-    application.run_polling(drop_pending_updates=True)
+    # ضد اسپم؛ قبل از همه هندلرها
+    app.add_handler(TypeHandler(Update, rate_limit), group=-1)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("additem", additem_start))
+    app.add_handler(CommandHandler("listitems", cmd_list_items))
+    app.add_handler(CommandHandler("wealth", wealth_command))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("restore", restore_backup))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_error)
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
