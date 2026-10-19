@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ================= تنظیمات =================
 # توکن رو توی محیط (Environment Variable) روی هاستت بذار، نه توی کد
-BOT_TOKEN = os."8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk"
+BOT_TOKEN = "8725147253:AAGyHLZQOED6YFCij-cV-_XrY9fgdFgczXk"
 ADMIN_ID = 5591238725
 ADMIN_ID_2 = 6270844351
 # گپی که پیام حراجی‌ها (Flash Sale) توش ارسال میشه
