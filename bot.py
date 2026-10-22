@@ -51,6 +51,9 @@ STREAK_STEP = 1                # پاداش استریک: هر روز پشت‌�
 STREAK_CAP = 6                 # حداکثر پاداش استریک (یعنی +۶ دلار از روز هفتم به بعد)
 WISHLIST_MAX = 5               # حداکثر آیتم‌های لیست آرزو
 SELL_DAILY_CAP = 750           # حداکثر پولی که یه بازیکن توی ۲۴ ساعت از «فروش به سرور» می‌گیره
+ORDER_PENDING_MAX = 5          # حداکثر سفارش تحویل‌نشده همزمان برای هر بازیکن
+SELL_PENDING_MAX = 5           # حداکثر درخواست فروش در انتظار همزمان
+BUY_QTY_MAX = 10               # حداکثر تعداد توی یک خرید («چند تا؟»)
 REF_INVITER_REWARD = 100       # جایزه دعوت‌کننده (بعد از تأیید ادمین)
 REF_INVITEE_REWARD = 50        # جایزه دعوت‌شده (بعد از تأیید ادمین)
 REF_MAX = 10                   # حداکثر دعوت جایزه‌دار برای هر نفر
@@ -234,6 +237,7 @@ def init_db():
         # مهاجرت دیتابیس‌های قدیمی
         _add_col(conn, "players", "last_work", "INTEGER NOT NULL DEFAULT 0")
         _add_col(conn, "players", "streak", "INTEGER NOT NULL DEFAULT 0")
+        _add_col(conn, "orders", "qty", "INTEGER NOT NULL DEFAULT 1")
         _add_col(conn, "items", "announce", "INTEGER NOT NULL DEFAULT 0")
         _add_col(conn, "players", "medals", "TEXT NOT NULL DEFAULT '[]'")
         _add_col(conn, "items", "photo_id", "TEXT")
@@ -685,6 +689,7 @@ def help_text(admin):
         f"🧾 از هر ترید {TRADE_TAX_PERCENT}٪ مالیات کم میشه.",
         "↩️ به‌جای @یوزرنیم می‌تونی روی پیام طرف ریپلای کنی.",
         f"💎 فروش به سرور: آیتم‌های خاص (طلا، نقره، سنگ‌های قیمتی...) رو به سرور بفروش؛ سقف دریافت {SELL_DAILY_CAP}$ در هر ۲۴ ساعت.",
+        f"🔢 توی صفحه آیتم «چند تا؟» رو بزن تا چندتایی بخری (یه سفارش میشه). حداکثر {ORDER_PENDING_MAX} سفارش تحویل‌نشده همزمان.",
         "⭐ لیست آرزو: آیتم دلخواهت رو ذخیره کن؛ وقتی پولت رسید بات خبرت می‌کنه.",
         "🤝 دعوت دوستان: لینک اختصاصی بگیر و بعد از ورود دوستت به سرور جایزه بگیر.",
         f"🔥 استریک: هر روز پشت‌سرهم جایزه بگیری پاداشت بیشتر میشه (تا +{STREAK_CAP * STREAK_STEP}$).",
@@ -814,6 +819,7 @@ async def show_item(query, context, item_id, note=None):
         lines.append("\n" + note)
     rows = [[buy_btn]]
     if not it["is_real"]:
+        rows[0].append(InlineKeyboardButton("🔢 چند تا؟", callback_data="bq_" + str(it["id"])))
         with db() as conn:
             wished = conn.execute("SELECT 1 FROM wishlist WHERE user_id=? AND item_id=?",
                                   (query.from_user.id, item_id)).fetchone()
@@ -828,15 +834,20 @@ async def show_item(query, context, item_id, note=None):
 ORDER_STATUS = {"pending": "⏳ در انتظار تحویل", "delivered": "✅ تحویل شد", "cancelled": "❌ لغو شد"}
 
 
-def create_order(conn, uid, username, item, price):
+def create_order(conn, uid, username, item, price, qty=1):
+    """price = کل مبلغ کم‌شده (برای برگشت پول موقع لغو)."""
     real = bool(item["is_real"])
     cur = conn.execute(
-        "INSERT INTO orders (user_id, username, item_name, category, price, real_price, created)"
-        " VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO orders (user_id, username, item_name, category, price, real_price, qty, created)"
+        " VALUES (?,?,?,?,?,?,?,?)",
         (uid, username, item["name"], item["category"], 0 if real else price,
-         item["real_price"] if real else None, int(time.time())),
+         item["real_price"] if real else None, 1 if real else qty, int(time.time())),
     )
     return cur.lastrowid
+
+
+def order_name(o):
+    return f"{o['item_name']} ×{o['qty']}" if o["qty"] > 1 else o["item_name"]
 
 
 def order_price_text(o):
@@ -850,31 +861,35 @@ def order_admin_markup(oid):
     ]])
 
 
-def try_buy(uid, item_id, username="player"):
-    """خرید اتمیک + ثبت سفارش. خروجی: (وضعیت, آیتم, موجودی, قیمت نهایی, کد سفارش)"""
+def try_buy(uid, item_id, username="player", qty=1):
+    """خرید اتمیک + ثبت یک سفارش. خروجی: (وضعیت, آیتم, موجودی/تعداد سفارش باز, کل قیمت, کد سفارش)"""
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item or item["is_real"]:
             return "no_item", None, 0, 0, 0
-        price = eff_price(item)
+        total = eff_price(item) * qty
         player = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
         if not player:
-            return "no_player", item, 0, price, 0
+            return "no_player", item, 0, total, 0
+        pending = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=? AND status='pending'",
+                               (uid,)).fetchone()[0]
+        if pending >= ORDER_PENDING_MAX:
+            return "too_many", item, pending, total, 0
         cars = get_cars(player)
-        if item["category"] == "car" and len(cars) >= MAX_CARS:
-            return "car_full", item, player["cash"], price, 0
-        if player["cash"] < price:
-            return "poor", item, player["cash"], price, 0
-        conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (price, uid))
+        if item["category"] == "car" and len(cars) + qty > MAX_CARS:
+            return "car_full", item, player["cash"], total, 0
+        if player["cash"] < total:
+            return "poor", item, player["cash"], total, 0
+        conn.execute("UPDATE players SET cash=cash-? WHERE user_id=?", (total, uid))
         if item["category"] == "car":
-            cars.append(item["name"])
+            cars.extend([item["name"]] * qty)
             conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), uid))
-        oid = create_order(conn, uid, username, item, price)
-        return "ok", item, player["cash"] - price, price, oid
+        oid = create_order(conn, uid, username, item, total, qty)
+        return "ok", item, player["cash"] - total, total, oid
 
 
-async def notify_admins(context, user, item, price=None, oid=None):
+async def notify_admins(context, user, item, price=None, oid=None, qty=1):
     real = bool(item["is_real"])
     uname = f"@{escape(user.username)}" if user.username else "ندارد"
     if real:
@@ -883,9 +898,13 @@ async def notify_admins(context, user, item, price=None, oid=None):
         note = "\n\n📞 باید با این پلیر هماهنگ کنی و پیگیری کنی. (چیزی از دارایی بازی‌اش کم نشده)"
     else:
         head = "🛒 <b>سفارش جدید!</b>"
-        price = eff_price(item) if price is None else price
-        price_line = f"💰 قیمت: {price:,} $" + (f" (🔥 حراجی، قیمت اصلی {item['buy_price']:,}$)"
-                                                 if price != item["buy_price"] else "")
+        total = eff_price(item) * qty if price is None else price
+        unit = total // qty if qty else total
+        price_line = f"💰 قیمت کل: {total:,} $"
+        if qty > 1:
+            price_line += f" ({qty} × {unit:,}$)"
+        if unit != item["buy_price"]:
+            price_line += f" (🔥 حراجی، قیمت اصلی هر عدد {item['buy_price']:,}$)"
         note = "\n\n📦 بعد از تحویل توی بازی، دکمه «تحویل داده شد» رو بزن."
     msg = (
         f"{head}\n{DIV}\n"
@@ -893,7 +912,7 @@ async def notify_admins(context, user, item, price=None, oid=None):
         f"👤 نام: <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a>\n"
         f"🔗 یوزرنیم: {uname}\n"
         f"🆔 آیدی: <code>{user.id}</code>\n"
-        f"📦 آیتم: {escape(item['name'])}\n"
+        f"📦 آیتم: {escape(item['name'])}" + (f" ×{qty}" if qty > 1 else "") + "\n"
         f"🏷️ دسته: {escape(cat_map().get(item['category'], item['category']))}\n"
         f"{price_line}\n\n"
         f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}{note}"
@@ -942,6 +961,14 @@ async def send_real_request(query, context, item_id):
     if now - _real_cooldown.get((user.id, item_id), -REAL_COOLDOWN) < REAL_COOLDOWN:
         await show(query, context, "⏳ درخواستت قبلاً ارسال شده. منتظر پیام ادمین باش.", back_main())
         return
+    with db() as conn:
+        n_pending = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=? AND status='pending'",
+                                 (user.id,)).fetchone()[0]
+    if n_pending >= ORDER_PENDING_MAX:
+        await show(query, context,
+                   f"⏳ {n_pending} سفارش تحویل‌نشده داری (حداکثر {ORDER_PENDING_MAX}).\n"
+                   f"صبر کن تحویل بگیری، بعد درخواست جدید بده.", back_main())
+        return
     _real_cooldown[(user.id, item_id)] = now
     with db() as conn:
         oid = create_order(conn, user.id, user_label(user), it, 0)
@@ -951,35 +978,51 @@ async def send_real_request(query, context, item_id):
                back_main())
 
 
-async def buy_item(query, context, item_id):
-    user = query.from_user
-    status, item, cash, price, oid = try_buy(user.id, item_id, user_label(user))
-
+async def purchase(context, user, item_id, qty=1):
+    """منطق مشترک خرید (دکمه یا «چند تا؟»). خروجی: (متن, کیبورد, موفق؟)"""
+    status, item, cash, price, oid = try_buy(user.id, item_id, user_label(user), qty)
+    orders_kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 سفارش‌های من", callback_data="my_orders"),
+                                       InlineKeyboardButton("🔙 منو", callback_data="main_menu")]])
     if status == "no_item":
+        return "❌ آیتم پیدا نشد.", back_main(), False
+    if status == "no_player":
+        return "❌ اول /start بزن.", back_main(), False
+    if status == "too_many":
+        return (f"⏳ {cash} سفارش تحویل‌نشده داری (حداکثر {ORDER_PENDING_MAX}).\n"
+                f"صبر کن ادمین تحویلشون بده، بعد سفارش جدید بزن."), orders_kb, False
+    if status == "car_full":
+        return f"❌ جای کافی برای {qty} ماشین نداری (سقف ماشین‌هات {MAX_CARS} عدد).\nاول یکی رو بفروش.", back_main(), False
+    if status == "poor":
+        return f"❌ پولت کمه!\n{DIV}\n💰 داری: {cash:,} $\n💵 نیاز داری: {price:,} $", back_main(), False
+
+    await notify_admins(context, user, item, price, oid, qty)
+    if should_announce(item):
+        await announce_purchase(context, user, item, price, qty)
+    extra = "🚗 به لیست ماشین‌هات اضافه شد.\n" if item["category"] == "car" else ""
+    text = (f"🎉 خرید موفق!\n{DIV}\n"
+            f"✅ {item['name']}" + (f" ×{qty}" if qty > 1 else "") +
+            f"\n💰 {price:,} $ کسر شد — موجودی: {cash:,} $\n{extra}\n"
+            f"📦 سفارش #{oid} ثبت شد. ادمین توی بازی تحویلت میده و بعدش همین‌جا بهت پیام میاد.")
+    return text, orders_kb, True
+
+
+async def buy_item(query, context, item_id, qty=1):
+    text, markup, ok = await purchase(context, query.from_user, item_id, qty)
+    await show(query, context, text, markup)
+    if ok:
+        await refresh_medals(context, query.from_user.id)
+
+
+async def start_buy_qty(query, context, item_id):
+    with db() as conn:
+        it = conn.execute("SELECT * FROM items WHERE id=? AND is_real=0", (item_id,)).fetchone()
+    if not it:
         await show(query, context, "❌ آیتم پیدا نشد.", back_main())
         return
-    if status == "no_player":
-        await show(query, context, "❌ اول /start بزن.", back_main())
-        return
-    if status == "car_full":
-        await show(query, context, f"❌ سقف ماشین‌هات ({MAX_CARS} عدد) پر شده.\nاول یکی رو بفروش.", back_main())
-        return
-    if status == "poor":
-        await show(query, context,
-                   f"❌ پولت کمه!\n{DIV}\n💰 داری: {cash:,} $\n💵 نیاز داری: {price:,} $", back_main())
-        return
-
-    await notify_admins(context, user, item, price, oid)
-    extra = "🚗 به لیست ماشین‌هات اضافه شد.\n" if item["category"] == "car" else ""
+    context.user_data.update(pstep="buy_qty", buy_item=item_id)
     await show(query, context,
-               f"🎉 خرید موفق!\n{DIV}\n"
-               f"✅ {item['name']}\n💰 {price:,} $ کسر شد — موجودی: {cash:,} $\n{extra}\n"
-               f"📦 سفارش #{oid} ثبت شد. ادمین توی بازی تحویلت میده و بعدش همین‌جا بهت پیام میاد.",
-               InlineKeyboardMarkup([[InlineKeyboardButton("📦 سفارش‌های من", callback_data="my_orders"),
-                                      InlineKeyboardButton("🔙 منو", callback_data="main_menu")]]))
-    if should_announce(item):
-        await announce_purchase(context, user, item, price)
-    await refresh_medals(context, user.id)
+               f"🔢 چند تا «{it['name']}» می‌خوای؟\n{DIV}\n💵 قیمت هر عدد: {eff_price(it):,}$\n"
+               f"عددی بین ۱ تا {BUY_QTY_MAX} بنویس (همه توی یه سفارش ثبت میشن):", cancel_player_markup())
 
 
 # ================= لیست آرزو =================
@@ -1067,8 +1110,8 @@ def should_announce(item):
     return item["category"] in cats
 
 
-async def announce_purchase(context, user, item, price):
-    text = (f"🎉 {user_label(user)} همین الان «{item['name']}» رو خرید!\n{DIV}\n"
+async def announce_purchase(context, user, item, price, qty=1):
+    text = (f"🎉 {user_label(user)} همین الان «{item['name']}»" + (f" ×{qty}" if qty > 1 else "") + f" رو خرید!\n{DIV}\n"
             f"🏷️ {cat_map().get(item['category'], item['category'])}\n💰 {price:,} $\n\n"
             f"🛒 تو هم از فروشگاه بات خرید کن!")
     try:
@@ -1315,6 +1358,10 @@ def create_sell_order(uid, username, item_id, qty):
         it = conn.execute("SELECT * FROM buy_items WHERE id=?", (item_id,)).fetchone()
         if not it:
             return "no_item", None
+        n_pending = conn.execute("SELECT COUNT(*) FROM sell_orders WHERE user_id=? AND status='pending'",
+                                 (uid,)).fetchone()[0]
+        if n_pending >= SELL_PENDING_MAX:
+            return "too_many", n_pending
         total = it["price"] * qty
         credited, pending, oldest = sell_window(conn, uid)
         remaining = max(0, SELL_DAILY_CAP - credited - pending)
@@ -1536,7 +1583,7 @@ async def show_my_orders(query, context):
     else:
         lines = ["📦 سفارش‌های من (۸ تای آخر)", DIV]
         for o in rows:
-            lines.append(f"#{o['id']} • {o['item_name']} • {order_price_text(o)}\n   {ORDER_STATUS.get(o['status'], o['status'])}")
+            lines.append(f"#{o['id']} • {order_name(o)} • {order_price_text(o)}\n   {ORDER_STATUS.get(o['status'], o['status'])}")
         text = "\n".join(lines)
     await show(query, context, text, back_main())
 
@@ -1548,7 +1595,7 @@ async def show_order_list(query, context, page=0):
         await show(query, context, f"📦 سفارش‌های باز\n{DIV}\n✅ سفارش تحویل‌نشده‌ای نیست.", admin_menu())
         return
     chunk, page, total = paginate(rows, page)
-    kb = [[InlineKeyboardButton(f"#{o['id']} • {o['username'] or o['user_id']} • {o['item_name']}"[:48],
+    kb = [[InlineKeyboardButton(f"#{o['id']} • {o['username'] or o['user_id']} • {order_name(o)}"[:48],
                                 callback_data=f"ov_{o['id']}")] for o in chunk]
     nav = page_nav("ol_", page, total)
     if nav:
@@ -1568,7 +1615,7 @@ async def show_order_detail(query, context, oid):
         return
     text = (f"📦 سفارش #{o['id']} — {ORDER_STATUS.get(o['status'], o['status'])}\n{DIV}\n"
             f"👤 {o['username'] or '-'}  |  🆔 {o['user_id']}\n"
-            f"🛍 {o['item_name']}\n💵 {order_price_text(o)}\n"
+            f"🛍 {order_name(o)}\n💵 {order_price_text(o)}\n"
             f"🕒 {datetime.fromtimestamp(o['created']).strftime('%Y-%m-%d %H:%M')}")
     kb = []
     if o["status"] == "pending":
@@ -1595,10 +1642,10 @@ async def deliver_order(query, context, oid):
         try:
             await context.bot.send_message(
                 chat_id=o["user_id"],
-                text=f"📦 سفارش #{oid} تحویل داده شد!\n{DIV}\n✅ {o['item_name']}\nاز خریدت ممنون 🙏 موفق باشی!")
+                text=f"📦 سفارش #{oid} تحویل داده شد!\n{DIV}\n✅ {order_name(o)}\nاز خریدت ممنون 🙏 موفق باشی!")
         except TelegramError:
             pass
-        await show(query, context, f"✅ سفارش #{oid} ({o['item_name']}) تحویل‌شده ثبت شد و به بازیکن اطلاع داده شد.", back)
+        await show(query, context, f"✅ سفارش #{oid} ({order_name(o)}) تحویل‌شده ثبت شد و به بازیکن اطلاع داده شد.", back)
 
 
 def do_cancel_order(oid):
@@ -1617,10 +1664,10 @@ def do_cancel_order(oid):
                 p = conn.execute("SELECT cars FROM players WHERE user_id=?", (o["user_id"],)).fetchone()
                 if p:
                     cars = get_cars(p)
-                    if o["item_name"] in cars:
-                        cars.remove(o["item_name"])
-                        conn.execute("UPDATE players SET cars=? WHERE user_id=?",
-                                     (json.dumps(cars), o["user_id"]))
+                    for _ in range(o["qty"]):
+                        if o["item_name"] in cars:
+                            cars.remove(o["item_name"])
+                    conn.execute("UPDATE players SET cars=? WHERE user_id=?", (json.dumps(cars), o["user_id"]))
         conn.execute("UPDATE orders SET status='cancelled', done_at=? WHERE id=?", (int(time.time()), oid))
     return "ok", o
 
@@ -1637,7 +1684,7 @@ async def cancel_order(query, context, oid):
         refund = "" if o["real_price"] else (f"\n💰 {o['price']:,} $ به حسابت برگشت." if o["price"] else "")
         try:
             await context.bot.send_message(chat_id=o["user_id"],
-                                           text=f"❌ سفارش #{oid} ({o['item_name']}) لغو شد.{refund}")
+                                           text=f"❌ سفارش #{oid} ({order_name(o)}) لغو شد.{refund}")
         except TelegramError:
             pass
         await show(query, context,
@@ -2019,6 +2066,19 @@ async def handle_player_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await reply_panel(update, f"✅ تیکت #{tid} ثبت شد!\n📩 به‌زودی ادمین‌ها جواب میدن.", back_main())
         return
 
+    if step == "buy_qty":
+        qty = parse_amount(text)
+        if qty is None or qty < 1 or qty > BUY_QTY_MAX:
+            await reply_panel(update, f"❌ یه عدد بین ۱ تا {BUY_QTY_MAX} بنویس.", cancel_player_markup())
+            return
+        item_id = ud.get("buy_item")
+        ud.clear()
+        out, markup, ok = await purchase(context, user, item_id, qty)
+        await reply_panel(update, out, markup)
+        if ok:
+            await refresh_medals(context, user.id)
+        return
+
     if step == "sell_qty":
         qty = parse_amount(text)
         if qty is None or qty <= 0 or qty > 1000:
@@ -2031,6 +2091,9 @@ async def handle_player_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                       InlineKeyboardButton("🔙 منو", callback_data="main_menu")]])
         if status == "no_item":
             await reply_panel(update, "❌ این آیتم دیگه خریده نمیشه.", back)
+        elif status == "too_many":
+            await reply_panel(update, f"⏳ {data} درخواست فروش در انتظار داری (حداکثر {SELL_PENDING_MAX}).\n"
+                                      f"صبر کن ادمین تأییدشون کنه، بعد درخواست جدید بده.", back)
         elif status == "cap":
             msg = (f"❌ این درخواست از سقف دریافت روزانه ({SELL_DAILY_CAP}$) بیشتره.\n{DIV}\n"
                    f"💵 هنوز می‌تونی تا {data['remaining']:,}$ بفروشی")
@@ -2936,6 +2999,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_item(q, context, num)
     elif data.startswith("buy_") and num is not None:
         await buy_item(q, context, num)
+    elif data.startswith("bq_") and num is not None:
+        await start_buy_qty(q, context, num)
     elif data.startswith("rqy_") and num is not None:
         await send_real_request(q, context, num)
     elif data.startswith("rq_") and num is not None:
