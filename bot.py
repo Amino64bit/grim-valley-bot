@@ -38,7 +38,7 @@ ANNOUNCE_CHAT_ID = int(os.environ.get("ANNOUNCE_CHAT_ID", "-1003431951834"))
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
 HOUSE_VALUE = 2500
-PAGE_SIZE = 5                 # تعداد آیتم در هر صفحه
+PAGE_SIZE = 7                 # تعداد آیتم در هر صفحه
 
 DAILY_MIN, DAILY_MAX = 10, 20  # جایزه روزانه
 WORK_MIN, WORK_MAX = 10, 50    # دستور /work
@@ -234,10 +234,35 @@ def init_db():
                                 ("یاقوت سرخ", 90), ("الماس", 130)]:
                 conn.execute("INSERT INTO buy_items (name, price) VALUES (?,?)", (name, price))
             set_setting(conn, "buy_seeded", "1")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bans (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT,
+            created INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS market (
+            key TEXT PRIMARY KEY,
+            price INTEGER NOT NULL,
+            prev INTEGER,
+            updated INTEGER NOT NULL DEFAULT 0
+        )""")
         # مهاجرت دیتابیس‌های قدیمی
         _add_col(conn, "players", "last_work", "INTEGER NOT NULL DEFAULT 0")
         _add_col(conn, "players", "streak", "INTEGER NOT NULL DEFAULT 0")
         _add_col(conn, "orders", "qty", "INTEGER NOT NULL DEFAULT 1")
+        _add_col(conn, "players", "joined", "INTEGER NOT NULL DEFAULT 0")
+        _add_col(conn, "players", "last_seen", "INTEGER NOT NULL DEFAULT 0")
+        # تأیید ورود: کاربرهای قدیمی پیش‌فرض ۱ (تأییدشده) می‌مونن؛ فقط کاربر جدید با ۰ ساخته میشه
+        _add_col(conn, "players", "approved", "INTEGER NOT NULL DEFAULT 1")
+        _add_col(conn, "buy_items", "market", "TEXT")
+        _add_col(conn, "buy_items", "factor", "INTEGER NOT NULL DEFAULT 100")
+        _add_col(conn, "buy_items", "prev_price", "INTEGER")
+        _add_col(conn, "items", "sale_price", "INTEGER")
+        conn.execute("INSERT OR IGNORE INTO market (key, price, prev, updated) VALUES ('gold', 20, NULL, 0)")
+        conn.execute("INSERT OR IGNORE INTO market (key, price, prev, updated) VALUES ('silver', 10, NULL, 0)")
+        # وصل کردن آیتم‌های پیش‌فرض به بازار (تکه = ۱۰۰٪، انگشتر = ۵۰٪)
+        for nm, mk, fc in [("طلا (تکه‌شده)", "gold", 100), ("انگشتر طلا", "gold", 50),
+                           ("نقره (تکه‌شده)", "silver", 100), ("انگشتر نقره", "silver", 50)]:
+            conn.execute("UPDATE buy_items SET market=?, factor=? WHERE name=? AND market IS NULL", (mk, fc, nm))
         _add_col(conn, "items", "announce", "INTEGER NOT NULL DEFAULT 0")
         _add_col(conn, "players", "medals", "TEXT NOT NULL DEFAULT '[]'")
         _add_col(conn, "items", "photo_id", "TEXT")
@@ -283,7 +308,8 @@ def get_medals(player):
 
 
 def ensure_player(conn, uid, username="player"):
-    conn.execute("INSERT OR IGNORE INTO players (user_id, username) VALUES (?,?)", (uid, username))
+    conn.execute("INSERT OR IGNORE INTO players (user_id, username, joined) VALUES (?,?,?)",
+                 (uid, username, int(time.time())))
 
 
 def user_label(user):
@@ -337,16 +363,23 @@ def on_sale(it):
 
 
 def eff_price(it):
+    """قیمت فعلی: اگه قیمت موقت فعال باشه همون، وگرنه قیمت اصلی (بعد از انقضا خودکار برمی‌گرده)."""
     if on_sale(it):
-        return it["buy_price"] * (100 - FLASH_DISCOUNT) // 100
+        sp = it["sale_price"]
+        return sp if sp is not None else it["buy_price"] * (100 - FLASH_DISCOUNT) // 100
     return it["buy_price"]
+
+
+def dir_arrow(new, old):
+    return "🔴⬇️" if new < old else ("🟢⬆️" if new > old else "⚪➖")
 
 
 def price_label(it):
     if it["is_real"]:
         return f"💶 {it['real_price']}"
     if on_sale(it):
-        return f"🔥{eff_price(it):,}$"
+        p = eff_price(it)
+        return f"🔥{p:,}$" if p < it["buy_price"] else f"📈{p:,}$"
     return f"{it['buy_price']:,}$"
 
 
@@ -391,6 +424,7 @@ def main_menu(admin=False):
          InlineKeyboardButton("🤝 دعوت دوستان", callback_data="invite")],
         [InlineKeyboardButton("💎 فروش به سرور", callback_data="sell"),
          InlineKeyboardButton("❓ راهنما", callback_data="help")],
+        [InlineKeyboardButton("❌ بستن منو", callback_data="close_panel")],
     ]
     if admin:
         rows.append([InlineKeyboardButton("🛠️ پنل مدیریت", callback_data="admin_panel")])
@@ -411,9 +445,12 @@ def admin_menu():
          InlineKeyboardButton("🎫 تیکت‌های باز", callback_data="tkl_0")],
         [InlineKeyboardButton("💎 قیمت‌های خرید", callback_data="bm"),
          InlineKeyboardButton("📥 درخواست‌های فروش", callback_data="sq_0")],
+        [InlineKeyboardButton("📈 قیمت بازار", callback_data="mk"),
+         InlineKeyboardButton("👥 کاربران", callback_data="ul_0")],
         [InlineKeyboardButton("🤝 دعوت‌ها", callback_data="rl_0"),
          InlineKeyboardButton("💾 بکاپ", callback_data="admin_backup")],
-        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")],
+        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu"),
+         InlineKeyboardButton("❌ بستن", callback_data="close_panel")],
     ])
 
 
@@ -702,18 +739,47 @@ def help_text(admin):
             "/admin /additem /listitems /wealth /backup /restore",
             "/newfaction نام — ساخت فکشن",
             "📦 سفارش‌ها: از پنل مدیریت (دکمه تحویل/لغو هم زیر پیام هر سفارش هست)",
-            "/flash آیدی_یا_اسم — حراجی ۲۴ ساعته | /endflash آیدی_یا_اسم",
+            "/flash آیدی_یا_اسم — حراجی ۵۰٪ برای ۲۴ ساعت | /endflash آیدی_یا_اسم",
+            "قیمت موقت دلخواه (کمتر/بیشتر): پنل ← لیست آیتم‌ها ← آیتم ← «قیمت کمتر/بیشتر»",
             DIV, "↩️ ریپلای روی پیام پلیر:",
             "+200 / -200 — پول | +house / -house",
             "+car اسم / -car اسم — ماشین",
             "+medal متن / -medal متن — مدال دستی",
             "/medal @یوزرنیم متن | /unmedal @یوزرنیم متن — مدال بدون ریپلای",
-            "💎 قیمت‌های خرید و درخواست‌های فروش: از پنل مدیریت",
+            "💎 قیمت‌های خرید، 📈 قیمت بازار (نوسان طلا و نقره) و 👥 کاربران: از پنل مدیریت",
+            "/ban @user دلیل | /unban @user | /kick @user | /user @user — مسدودی، رفع مسدودی، کیک از گپ، پروفایل",
             "/announce ماشین یا /اعلام ماشین — روشن/خاموش اعلام خرید یه دسته توی گپ",
             "+faction نام / -faction — فکشن",
             "+leader / -leader — لیدر فکشن",
+            "🆕 هر کاربر جدید قبل از استفاده از بات باید توسط ادمین تأیید بشه (پیامش برات میاد).",
         ]
     return "\n".join(lines)
+
+
+# ================= تأیید کاربر جدید =================
+def is_approved(conn, uid):
+    if is_admin(uid):
+        return True
+    row = conn.execute("SELECT approved FROM players WHERE user_id=?", (uid,)).fetchone()
+    return bool(row and row["approved"])
+
+
+async def notify_new_user(context, user):
+    uname = f"@{escape(user.username)}" if user.username else "ندارد"
+    msg = (f"🆕 <b>کاربر جدید می‌خواد وارد بات بشه</b>\n{DIV}\n"
+           f"👤 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a>\n"
+           f"🔗 یوزرنیم: {uname}\n🆔 آیدی: <code>{user.id}</code>\n\n"
+           f"تأیید می‌کنی؟")
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تأیید", callback_data=f"nuy_{user.id}"),
+        InlineKeyboardButton("❌ رد (مسدود)", callback_data=f"nun_{user.id}"),
+    ]])
+    for admin in (ADMIN_ID, ADMIN_ID_2):
+        try:
+            await context.bot.send_message(chat_id=admin, text=msg, parse_mode=ParseMode.HTML,
+                                           reply_markup=markup)
+        except Exception as e:
+            logger.error("Failed to notify new user to %s: %s", admin, e)
 
 
 # ================= منوی پلیر =================
@@ -725,16 +791,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = user_label(user)
     payload = (context.args[0] if context.args else "") or ""
     inviter = None
+    is_new = False
     with db() as conn:
         existed = conn.execute("SELECT 1 FROM players WHERE user_id=?", (user.id,)).fetchone() is not None
-        ensure_player(conn, user.id, name)
+        if not existed:
+            is_new = True
+            conn.execute("INSERT OR IGNORE INTO players (user_id, username, joined, approved) VALUES (?,?,?,?)",
+                         (user.id, name, int(time.time()), 1 if is_admin(user.id) else 0))
         conn.execute("UPDATE players SET username=? WHERE user_id=?", (name, user.id))
-        if not existed and payload.startswith("ref_") and payload[4:].isdigit() and int(payload[4:]) != user.id:
+        approved = is_approved(conn, user.id)
+        if is_new and payload.startswith("ref_") and payload[4:].isdigit() and int(payload[4:]) != user.id:
             inviter = conn.execute("SELECT user_id, username FROM players WHERE user_id=?",
                                    (int(payload[4:]),)).fetchone()
             if inviter:
                 conn.execute("INSERT OR IGNORE INTO referrals (invitee_id, inviter_id, created) VALUES (?,?,?)",
                              (user.id, inviter["user_id"], int(time.time())))
+    if not approved:
+        await update.message.reply_text(
+            "⏳ درخواست ورودت برای ادمین ارسال شد.\nبعد از تأیید بهت پیام میاد؛ لطفاً صبر کن.")
+        if is_new:
+            await notify_new_user(context, user)
+        return
     extra = f"\n\n🤝 با دعوت {inviter['username'] or 'یه دوست'} اومدی!" if inviter else ""
     await reply_panel(update, main_text(user) + extra, main_menu(is_admin(user.id)))
     if inviter:
@@ -775,16 +852,12 @@ async def show_category(query, context, category, page=0):
         await show(query, context, "📦 این دسته فعلاً خالی است.", back_main())
         return
     chunk, page, total = paginate(items, page)
-    keyboard, row = [], []
+    # هر آیتم توی یه ردیف جدا (ستونی)، حداکثر ۷ آیتم توی هر صفحه
+    keyboard = []
     for it in chunk:
         icon = "🖼 " if it["photo_id"] else ""
         label = f"{icon}{it['name']} | {price_label(it)}"
-        row.append(InlineKeyboardButton(label[:48], callback_data="pick_" + str(it["id"])))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data="pick_" + str(it["id"]))])
     nav = page_nav(f"cat_{category}_", page, total)
     if nav:
         keyboard.append(nav)
@@ -810,8 +883,9 @@ async def show_item(query, context, item_id, note=None):
     else:
         if on_sale(it):
             left = it["sale_until"] - time.time()
-            lines.append(f"💵 قیمت: 🔥 {eff_price(it):,}$  (قبلاً {it['buy_price']:,}$)")
-            lines.append(f"⚡ حراجی {FLASH_DISCOUNT}٪ — {fmt_duration(left)} مونده!")
+            p, o = eff_price(it), it["buy_price"]
+            lines.append(f"💵 قیمت: {dir_arrow(p, o)} {p:,}$  (قبلاً {o:,}$)")
+            lines.append(("🔥 حراجی!" if p < o else "📢 قیمت موقت!") + f" — {fmt_duration(left)} مونده")
         else:
             lines.append(f"💵 قیمت: {it['buy_price']:,}$")
         buy_btn = InlineKeyboardButton(f"🛒 خرید ({eff_price(it):,}$)", callback_data="buy_" + str(it["id"]))
@@ -904,7 +978,7 @@ async def notify_admins(context, user, item, price=None, oid=None, qty=1):
         if qty > 1:
             price_line += f" ({qty} × {unit:,}$)"
         if unit != item["buy_price"]:
-            price_line += f" (🔥 حراجی، قیمت اصلی هر عدد {item['buy_price']:,}$)"
+            price_line += f" (قیمت موقت — قیمت اصلی هر عدد {item['buy_price']:,}$)"
         note = "\n\n📦 بعد از تحویل توی بازی، دکمه «تحویل داده شد» رو بزن."
     msg = (
         f"{head}\n{DIV}\n"
@@ -1082,7 +1156,10 @@ async def show_wishlist(query, context):
 
 
 async def notify_wishers(context, it):
-    """وقتی آیتمی حراج میشه، به کسایی که توی لیست آرزوشون دارن پیوی می‌فرسته."""
+    """وقتی قیمت یه آیتم موقتاً کم میشه، به کسایی که توی لیست آرزوشون دارن پیوی می‌فرسته."""
+    if eff_price(it) >= it["buy_price"]:
+        return
+    hours = max(1, round((it["sale_until"] - time.time()) / 3600))
     with db() as conn:
         ids = [r["user_id"] for r in conn.execute(
             "SELECT user_id FROM wishlist WHERE item_id=? LIMIT 100", (it["id"],))]
@@ -1090,8 +1167,8 @@ async def notify_wishers(context, it):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=(f"🔥 آیتم آرزوت حراج شد!\n{DIV}\n🛍 {it['name']}\n"
-                      f"💵 {it['buy_price']:,}$ ➜ {eff_price(it):,}$ (فقط {FLASH_HOURS} ساعت)"),
+                text=(f"🔥 قیمت آیتم آرزوت پایین اومد!\n{DIV}\n🛍 {it['name']}\n"
+                      f"🔴⬇️ {it['buy_price']:,}$ ➜ {eff_price(it):,}$ (فقط {hours} ساعت)"),
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🛒 برو به صفحه آیتم", callback_data="pick_" + str(it["id"]))]]))
         except TelegramError:
@@ -1409,7 +1486,7 @@ async def show_sell_menu(query, context):
         return
     remaining = max(0, SELL_DAILY_CAP - credited - pending)
     lines = ["💎 فروش به سرور", DIV, "سرور این آیتم‌ها رو از تو می‌خره 👇"]
-    lines += [f"• {it['name']} — {it['price']:,}$" for it in items]
+    lines += [price_row(it) for it in items]
     lines += [DIV,
               f"📊 سقف دریافت: {SELL_DAILY_CAP:,}$ در هر ۲۴ ساعت",
               f"   دریافتی: {credited:,}$ | در انتظار: {pending:,}$ | باقی‌مانده: {remaining:,}$"]
@@ -1551,7 +1628,7 @@ async def show_buy_manage(query, context):
     with db() as conn:
         items = conn.execute("SELECT * FROM buy_items ORDER BY id").fetchall()
     lines = ["💎 قیمت‌های خرید از بازیکن", DIV, f"📊 سقف دریافت هر بازیکن: {SELL_DAILY_CAP:,}$ در ۲۴ ساعت", ""]
-    lines += [f"• {it['name']} — {it['price']:,}$" for it in items] or ["(هنوز آیتمی نیست)"]
+    lines += [price_row(it) for it in items] or ["(هنوز آیتمی نیست)"]
     kb = [[InlineKeyboardButton(f"✏️ {it['name']} ({it['price']:,}$)"[:48], callback_data=f"bi_{it['id']}")]
           for it in items]
     kb.append([InlineKeyboardButton("➕ افزودن آیتم خرید", callback_data="bnew")])
@@ -1565,12 +1642,458 @@ async def show_buy_detail(query, context, iid):
     if not it:
         await show_buy_manage(query, context)
         return
+    mk = f"{MARKET_NAMES[it['market']]} ({it['factor']}٪ قیمت بازار)" if it["market"] in MARKET_NAMES else "ندارد"
     kb = [[InlineKeyboardButton("✏️ قیمت", callback_data=f"bpe_{iid}"),
            InlineKeyboardButton("✏️ اسم", callback_data=f"bne_{iid}")],
-          [InlineKeyboardButton("🗑 حذف", callback_data=f"bdl_{iid}")],
-          [InlineKeyboardButton("🔙 لیست", callback_data="bm")]]
-    await show(query, context, f"💎 {it['name']}\n{DIV}\n💵 قیمت خرید: {it['price']:,}$",
+          [InlineKeyboardButton("📈 نوسان قیمت: " + (MARKET_NAMES.get(it["market"], "ندارد")),
+                                callback_data=f"bmk_{iid}")]]
+    if it["market"] in MARKET_NAMES:
+        kb.append([InlineKeyboardButton(f"⚖️ نسبت به قیمت بازار: {it['factor']}٪ (تغییر)", callback_data=f"bfc_{iid}")])
+    kb += [[InlineKeyboardButton("🗑 حذف", callback_data=f"bdl_{iid}")],
+           [InlineKeyboardButton("🔙 لیست", callback_data="bm")]]
+    await show(query, context, f"💎 {it['name']}\n{DIV}\n💵 قیمت خرید: {price_row_value(it)}\n📈 نوسان روزانه: {mk}",
                InlineKeyboardMarkup(kb))
+
+
+# ===================================================================
+#  بازار طلا و نقره (نوسان روزانه) + مدیریت کاربران
+# ===================================================================
+MARKET_NAMES = {"gold": "🥇 طلا", "silver": "🥈 نقره"}
+# (حداقل, حداکثر, وزن): هر بار اول یه بازه انتخاب میشه، بعد یه عدد تصادفی داخلش
+GOLD_BUCKETS = [(10, 14, 25), (15, 19, 35), (20, 20, 15), (21, 27, 18), (28, 35, 7)]
+SILVER_BUCKETS = [(5, 9, 45), (10, 10, 20), (11, 14, 22), (15, 17, 9), (18, 20, 4)]
+
+
+def trend_arrow(cur, prev):
+    if prev is None:
+        return ""
+    if cur > prev:
+        return f"🟢⬆️ +{cur - prev}"
+    if cur < prev:
+        return f"🔴⬇️ -{prev - cur}"
+    return "⚪➖"
+
+
+def price_row_value(it):
+    arrow = trend_arrow(it["price"], it["prev_price"])
+    return f"{it['price']:,}$" + (f"  {arrow}" if arrow else "")
+
+
+def price_row(it):
+    return f"• {it['name']} — {price_row_value(it)}"
+
+
+def roll_price(buckets):
+    lo, hi, _w = random.choices(buckets, weights=[b[2] for b in buckets])[0]
+    return random.randint(lo, hi)
+
+
+def set_market_price(conn, key, new, now):
+    """قیمت پایه‌ی بازار رو عوض می‌کنه و روی آیتم‌های وصل‌شده اعمال می‌کنه. قیمت قبلی رو برمی‌گردونه."""
+    old = conn.execute("SELECT price FROM market WHERE key=?", (key,)).fetchone()["price"]
+    conn.execute("UPDATE market SET prev=?, price=?, updated=? WHERE key=?", (old, new, now, key))
+    for it in conn.execute("SELECT id, factor, price FROM buy_items WHERE market=?", (key,)).fetchall():
+        conn.execute("UPDATE buy_items SET prev_price=?, price=? WHERE id=?",
+                     (it["price"], max(1, (new * it["factor"] + 50) // 100), it["id"]))
+    return old
+
+
+def roll_market():
+    """قیمت جدید تصادفی طلا و نقره."""
+    now = int(time.time())
+    out = {}
+    with db() as conn:
+        for key, buckets in (("gold", GOLD_BUCKETS), ("silver", SILVER_BUCKETS)):
+            new = roll_price(buckets)
+            out[key] = (set_market_price(conn, key, new, now), new)
+    return out
+
+
+def market_text(title, note=None):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM market ORDER BY CASE key WHEN 'gold' THEN 0 ELSE 1 END").fetchall()
+        linked = conn.execute("SELECT * FROM buy_items WHERE market IS NOT NULL ORDER BY market DESC, factor DESC").fetchall()
+    lines = [title, DIV]
+    if note:
+        lines += [note, ""]
+    for r in rows:
+        lines.append(f"{MARKET_NAMES.get(r['key'], r['key'])} (تکه‌شده): {r['price']}$  {trend_arrow(r['price'], r['prev'])}".rstrip())
+    last = max((r["updated"] for r in rows), default=0)
+    if linked:
+        lines += ["", "آیتم‌های وابسته:"] + [price_row(it) for it in linked]
+    return "\n".join(lines), last
+
+
+async def show_market(query, context, note=None):
+    text, last = market_text("📈 بازار طلا و نقره", note)
+    text += (f"\n\n🕒 آخرین تغییر: {fmt_duration(time.time() - last) + ' پیش' if last else 'هنوز تغییری نداده'}"
+             f"\n🎲 بازه‌ها: طلا {GOLD_BUCKETS[0][0]}–{GOLD_BUCKETS[-1][1]}$ | نقره {SILVER_BUCKETS[0][0]}–{SILVER_BUCKETS[-1][1]}$"
+             f"\n(قیمت‌های پایین‌تر شانس بیشتری دارن)")
+    await show(query, context, text, InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 ساخت قیمت امروز", callback_data="mkroll")],
+        [InlineKeyboardButton("🥇 طلا: قیمت کمتر", callback_data="mkd_gold"),
+         InlineKeyboardButton("🥇 طلا: قیمت بیشتر", callback_data="mku_gold")],
+        [InlineKeyboardButton("🥈 نقره: قیمت کمتر", callback_data="mkd_silver"),
+         InlineKeyboardButton("🥈 نقره: قیمت بیشتر", callback_data="mku_silver")],
+        [InlineKeyboardButton("📣 اعلام قیمت‌ها توی گپ", callback_data="mkann")],
+        [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_panel")]]))
+
+
+async def announce_market(context, note=None, title="📈 قیمت امروز خرید سرور"):
+    text, _last = market_text(title, note)
+    text += "\n\n💎 برای فروش از منوی بات «فروش به سرور» رو بزن."
+    try:
+        await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, text=text)
+        return None
+    except Exception as e:
+        logger.error("Market announce failed: %s", e)
+        return str(e)
+
+
+# ---------- مسدودسازی / تأیید ورود / پروفایل / حذف ----------
+def is_banned(conn, uid):
+    return conn.execute("SELECT reason FROM bans WHERE user_id=?", (uid,)).fetchone()
+
+
+_seen = {}
+
+
+async def access_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قبل از همه: کاربر مسدودشده یا تأییدنشده بلاک میشه و آخرین فعالیت ثبت میشه."""
+    user = update.effective_user
+    if not user:
+        return
+    now = time.time()
+    with db() as conn:
+        ban = None if is_admin(user.id) else is_banned(conn, user.id)
+        if not ban and now - _seen.get(user.id, 0) > 600:
+            conn.execute("UPDATE players SET last_seen=? WHERE user_id=?", (int(now), user.id))
+            _seen[user.id] = now
+    if not ban:
+        if is_admin(user.id):
+            return
+        # کاربر تأییدنشده (یا ثبت‌نام‌نکرده): فقط /start مجازه
+        with db() as conn:
+            row = conn.execute("SELECT approved FROM players WHERE user_id=?", (user.id,)).fetchone()
+        if row is not None and row["approved"]:
+            return
+        msg_ = update.effective_message
+        txt_ = (msg_.text or "") if msg_ else ""
+        if txt_.startswith("/start"):
+            return
+        pending_text = ("⏳ هنوز ادمین ورودت رو تأیید نکرده. صبر کن." if row is not None
+                        else "❌ اول توی پیوی بات /start بزن تا ثبت‌نام بشی.")
+        try:
+            if update.callback_query:
+                await update.callback_query.answer(pending_text, show_alert=True)
+            elif msg_ and (msg_.chat.type == "private" or txt_.startswith("/")):
+                await msg_.reply_text(pending_text)
+        except TelegramError:
+            pass
+        raise ApplicationHandlerStop
+    text = f"🚫 شما از استفاده از این بات مسدود شدید.\nدلیل: {ban['reason'] or 'نامشخص'}"
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        elif update.effective_message and (update.effective_message.chat.type == "private"
+                                           or (update.effective_message.text or "").startswith("/")):
+            await update.effective_message.reply_text(text)
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def notify_user(context, uid, text):
+    try:
+        await context.bot.send_message(chat_id=uid, text=text)
+        return True
+    except TelegramError:
+        return False
+
+
+def do_ban(uid, reason):
+    if is_admin(uid):
+        return False
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO bans (user_id, reason, created) VALUES (?,?,?)",
+                     (uid, (reason or "").strip() or None, int(time.time())))
+    return True
+
+
+def do_unban(uid):
+    with db() as conn:
+        n = conn.execute("DELETE FROM bans WHERE user_id=?", (uid,)).rowcount
+    return n > 0
+
+
+def new_user_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_panel")]])
+
+
+async def approve_user(query, context, uid):
+    changed = False
+    ref = None
+    with db() as conn:
+        p = conn.execute("SELECT approved FROM players WHERE user_id=?", (uid,)).fetchone()
+        if p and not p["approved"]:
+            conn.execute("UPDATE players SET approved=1 WHERE user_id=?", (uid,))
+            changed = True
+            ref = conn.execute(
+                "SELECT r.inviter_id AS user_id, pl.username AS username FROM referrals r "
+                "LEFT JOIN players pl ON pl.user_id=r.inviter_id "
+                "WHERE r.invitee_id=? AND r.status='pending'", (uid,)).fetchone()
+    if not p:
+        text = "❌ این کاربر پیدا نشد (شاید قبلاً رد شده)."
+    elif not changed:
+        text = f"⚠️ کاربر {uid} قبلاً تأیید شده بود."
+    else:
+        text = f"✅ کاربر {uid} تأیید شد."
+        await notify_user(context, uid, "✅ ورودت به بات تأیید شد! حالا /start بزن و شروع کن 🎮")
+        if ref:
+            # اعلان دعوت (برای تأیید ورود به سرور) حالا که کاربر تأیید شد به ادمین‌ها میره
+            try:
+                chat = await context.bot.get_chat(uid)
+                await notify_referral(context, chat, ref)
+            except Exception as e:
+                logger.error("Referral notify after approval failed: %s", e)
+    await show(query, context, text, new_user_back())
+
+
+async def reject_user(query, context, uid):
+    if is_admin(uid):
+        await show(query, context, "❌ نمی‌شه ادمین رو رد کرد.", new_user_back())
+        return
+    with db() as conn:
+        p = conn.execute("SELECT approved FROM players WHERE user_id=?", (uid,)).fetchone()
+        if p and p["approved"]:
+            already = True
+        else:
+            already = False
+            conn.execute("DELETE FROM players WHERE user_id=? AND approved=0", (uid,))
+            conn.execute("DELETE FROM referrals WHERE invitee_id=? AND status='pending'", (uid,))
+    if already:
+        await show(query, context, f"⚠️ کاربر {uid} قبلاً تأیید شده بود؛ برای مسدود کردنش از پنل کاربران استفاده کن.",
+                   new_user_back())
+        return
+    do_ban(uid, "درخواست ورود رد شد")
+    await notify_user(context, uid, "❌ درخواست ورودت به بات رد شد.")
+    await show(query, context, f"❌ کاربر {uid} رد و مسدود شد.", new_user_back())
+
+
+def delete_player(uid):
+    """همه‌ی اطلاعات بازی کاربر پاک میشه (می‌تونه دوباره /start بزنه). مسدودی پاک نمیشه."""
+    if is_admin(uid):
+        return None
+    now = int(time.time())
+    with db() as conn:
+        pending = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=? AND status='pending'", (uid,)).fetchone()[0]
+        remove_member(conn, uid)
+        conn.execute("DELETE FROM wishlist WHERE user_id=?", (uid,))
+        conn.execute("UPDATE orders SET status='cancelled', done_at=? WHERE user_id=? AND status='pending'", (now, uid))
+        conn.execute("UPDATE sell_orders SET status='rejected', done_at=? WHERE user_id=? AND status='pending'", (now, uid))
+        conn.execute("UPDATE tickets SET status='closed' WHERE user_id=? AND status!='closed'", (uid,))
+        conn.execute("DELETE FROM referrals WHERE invitee_id=? AND status='pending'", (uid,))
+        conn.execute("UPDATE referrals SET status='rejected', done_at=? WHERE inviter_id=? AND status='pending'", (now, uid))
+        deleted = conn.execute("DELETE FROM players WHERE user_id=?", (uid,)).rowcount
+    return {"existed": deleted > 0, "pending": pending}
+
+
+async def kick_from_group(context, uid):
+    """کیک از گپ (می‌تونه دوباره عضو بشه). خروجی: متن خطا یا None."""
+    if is_admin(uid):
+        return "نمی‌شه ادمین رو کیک کرد."
+    try:
+        await context.bot.ban_chat_member(ANNOUNCE_CHAT_ID, uid)
+        await context.bot.unban_chat_member(ANNOUNCE_CHAT_ID, uid, only_if_banned=True)
+    except Exception as e:
+        logger.error("Kick failed: %s", e)
+        return str(e)
+    await notify_user(context, uid, "⚠️ تذکر: ادمین تو رو از گپ کیک کرد.\n"
+                                    "می‌تونی دوباره عضو بشی؛ لطفاً قوانین رو رعایت کن.")
+    return None
+
+
+async def tg_profile(context, uid):
+    info = {"name": None, "username": None, "bio": None, "photo": None}
+    try:
+        chat = await context.bot.get_chat(uid)
+        info["name"] = " ".join(x for x in (chat.first_name, chat.last_name) if x) or None
+        info["username"] = chat.username
+        info["bio"] = getattr(chat, "bio", None)
+    except Exception:
+        pass
+    try:
+        photos = await context.bot.get_user_profile_photos(uid, limit=1)
+        if photos.total_count and photos.photos:
+            info["photo"] = photos.photos[0][-1].file_id
+    except Exception:
+        pass
+    return info
+
+
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "نامشخص"
+
+
+async def show_user_profile(query, context, uid):
+    with db() as conn:
+        p = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        ban = is_banned(conn, uid)
+        stats = {}
+        if p:
+            stats["orders"] = conn.execute("SELECT COUNT(*), SUM(status='pending') FROM orders WHERE user_id=?", (uid,)).fetchone()
+            stats["tickets"] = conn.execute("SELECT COUNT(*) FROM tickets WHERE user_id=?", (uid,)).fetchone()[0]
+            stats["sold"] = conn.execute("SELECT COALESCE(SUM(total),0) FROM sell_orders WHERE user_id=? AND status='accepted'",
+                                         (uid,)).fetchone()[0]
+            stats["fac"] = faction_of(conn, uid)
+    info = await tg_profile(context, uid)
+    lines = ["👤 پروفایل کاربر", DIV, f"🆔 {uid}"]
+    if info["name"]:
+        lines.append(f"📛 نام: {info['name']}")
+    uname = info["username"] or (p["username"] if p else None)
+    if uname:
+        lines.append(f"🔗 یوزرنیم: @{uname}" if info["username"] else f"🔗 نام ثبت‌شده: {uname}")
+    if info["bio"]:
+        lines.append(f"📝 بیو: {info['bio'][:120]}")
+    status_txt = f"🚫 مسدود — {ban['reason'] or 'بدون دلیل'}" if ban else (
+        "⏳ در انتظار تأیید ورود" if (p and not p["approved"]) else "✅ فعال")
+    lines.append("🚦 وضعیت: " + status_txt)
+    if p:
+        cars = get_cars(p)
+        medals = get_medals(p)
+        lines += [DIV, f"💰 پول نقد: {p['cash']:,} $", f"🏠 خانه: {'دارد' if p['has_house'] else 'ندارد'}",
+                  f"🚗 ماشین‌ها ({len(cars)}/{MAX_CARS}): " + (", ".join(cars) if cars else "—"),
+                  "🏅 مدال‌ها: " + (" | ".join(medals) if medals else "—")]
+        if stats["fac"]:
+            lines.append(f"🏴 فکشن: {stats['fac']['name']}" + (" 👑" if stats["fac"]["leader_id"] == uid else ""))
+        lines += [f"🔥 استریک: {p['streak']} روز",
+                  f"📦 سفارش‌ها: {stats['orders'][0]} (تحویل‌نشده: {stats['orders'][1] or 0})",
+                  f"💎 فروخته به سرور: {stats['sold']:,}$ | 🎫 تیکت‌ها: {stats['tickets']}",
+                  f"🗓 عضویت: {fmt_ts(p['joined'])}", f"🕒 آخرین فعالیت: {fmt_ts(p['last_seen'])}"]
+    else:
+        lines += [DIV, "این کاربر توی بات ثبت‌نام نکرده (یا حذف شده)."]
+    kb = []
+    if p and not p["approved"] and not ban:
+        kb.append([InlineKeyboardButton("✅ تأیید ورود", callback_data=f"nuy_{uid}"),
+                   InlineKeyboardButton("❌ رد", callback_data=f"nun_{uid}")])
+    kb += [[InlineKeyboardButton("✅ رفع مسدودی" if ban else "🚫 مسدود کردن",
+                                 callback_data=f"uub_{uid}" if ban else f"ub_{uid}")],
+           [InlineKeyboardButton("👢 کیک از گپ", callback_data=f"uk_{uid}"),
+            InlineKeyboardButton("🗑 حذف از بات", callback_data=f"ud_{uid}")],
+           [InlineKeyboardButton("🔙 لیست کاربران", callback_data="ul_0")]]
+    await show(query, context, "\n".join(lines), InlineKeyboardMarkup(kb), photo=info["photo"])
+
+
+async def show_user_list(query, context, page=0, banned_only=False):
+    with db() as conn:
+        if banned_only:
+            rows = conn.execute("SELECT b.user_id AS user_id, p.username AS username, p.cash AS cash, 1 AS banned, "
+                                "0 AS waiting "
+                                "FROM bans b LEFT JOIN players p ON p.user_id=b.user_id ORDER BY b.created DESC").fetchall()
+        else:
+            rows = conn.execute("SELECT p.user_id AS user_id, p.username AS username, p.cash AS cash, "
+                                "(b.user_id IS NOT NULL) AS banned, (p.approved=0) AS waiting FROM players p "
+                                "LEFT JOIN bans b ON b.user_id=p.user_id ORDER BY p.approved ASC, "
+                                "p.last_seen DESC, p.user_id DESC").fetchall()
+    prefix = "ulb_" if banned_only else "ul_"
+    chunk, page, total = paginate(rows, page)
+    kb = [[InlineKeyboardButton(
+        f"{'🚫 ' if r['banned'] else ('⏳ ' if r['waiting'] else '')}{r['username'] or r['user_id']} • {(r['cash'] or 0):,}$"[:48],
+        callback_data=f"uv_{r['user_id']}")] for r in chunk]
+    nav = page_nav(prefix, page, total)
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🔎 جستجو", callback_data="usearch"),
+               InlineKeyboardButton("✅ همه" if banned_only else "🚫 مسدودها",
+                                    callback_data="ul_0" if banned_only else "ulb_0")])
+    kb.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_panel")])
+    title = ("🚫 کاربران مسدود" if banned_only else "👥 کاربران") + f" ({len(rows)})"
+    if total > 1:
+        title += f" — صفحه {page + 1} از {total}"
+    hint = "(خالیه)" if not rows else "روی هر کاربر بزن تا پروفایلش رو ببینی.\n⏳ = منتظر تأیید ورود"
+    await show(query, context, f"{title}\n{DIV}\n" + hint, InlineKeyboardMarkup(kb))
+
+
+def user_back(uid):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👤 پروفایل", callback_data=f"uv_{uid}"),
+                                  InlineKeyboardButton("👥 کاربران", callback_data="ul_0")]])
+
+
+async def resolve_user_arg(update, args):
+    """(uid, label, بقیه‌ی آرگومان‌ها) یا (None, پیام خطا, [])"""
+    args = list(args or [])
+    reply = update.message.reply_to_message
+    if reply and reply.from_user and not (args and (args[0].startswith("@") or args[0].isdigit())):
+        return reply.from_user.id, user_label(reply.from_user), args
+    if not args:
+        return None, "❌ روی پیام کاربر ریپلای کن یا @یوزرنیم / آیدی عددی بنویس.", []
+    a = args[0]
+    with db() as conn:
+        if a.startswith("@"):
+            row = conn.execute("SELECT user_id, username FROM players WHERE lower(username)=lower(?)", (a[1:],)).fetchone()
+            if not row:
+                return None, "❌ کاربری با این یوزرنیم توی بات پیدا نشد.", []
+            return row["user_id"], row["username"] or a, args[1:]
+        if a.isdigit():
+            row = conn.execute("SELECT username FROM players WHERE user_id=?", (int(a),)).fetchone()
+            return int(a), (row["username"] if row and row["username"] else a), args[1:]
+    return None, "❌ آرگومان نامعتبر.", []
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid, label, rest = await resolve_user_arg(update, context.args)
+    if uid is None:
+        await update.message.reply_text(label + "\nمثال: /ban @user دلیل")
+        return
+    reason = " ".join(rest)
+    if not do_ban(uid, reason):
+        await update.message.reply_text("❌ نمی‌شه ادمین رو مسدود کرد.")
+        return
+    await notify_user(context, uid, f"🚫 دسترسی تو به بات مسدود شد.\nدلیل: {reason or 'نامشخص'}")
+    await update.message.reply_text(f"🚫 {label} مسدود شد." + (f"\nدلیل: {reason}" if reason else ""))
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid, label, _rest = await resolve_user_arg(update, context.args)
+    if uid is None:
+        await update.message.reply_text(label + "\nمثال: /unban @user")
+        return
+    if do_unban(uid):
+        await notify_user(context, uid, "✅ مسدودیتت برداشته شد. می‌تونی دوباره از بات استفاده کنی.")
+        await update.message.reply_text(f"✅ مسدودیت {label} برداشته شد.")
+    else:
+        await update.message.reply_text("⚠️ این کاربر مسدود نبود.")
+
+
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid, label, _rest = await resolve_user_arg(update, context.args)
+    if uid is None:
+        await update.message.reply_text(label + "\nمثال: /kick @user")
+        return
+    err = await kick_from_group(context, uid)
+    await update.message.reply_text(f"👢 {label} از گپ کیک شد (می‌تونه دوباره عضو بشه)." if not err else
+                                    f"❌ کیک انجام نشد: {err}\n(بات باید توی گپ ادمین با دسترسی بن باشه)")
+
+
+async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/user @یوزرنیم — خلاصه‌ی پروفایل (متنی)"""
+    if not is_admin(update.effective_user.id):
+        return
+    uid, label, _rest = await resolve_user_arg(update, context.args)
+    if uid is None:
+        await update.message.reply_text(label + "\nمثال: /user @user")
+        return
+    with db() as conn:
+        p = conn.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        ban = is_banned(conn, uid)
+        text = asset_text(conn, p) if p else "این کاربر توی بات ثبت‌نام نکرده."
+    await update.message.reply_text(f"🆔 {uid}" + (f" | 🚫 مسدود: {ban['reason'] or 'بدون دلیل'}" if ban else "") + f"\n{text}")
 
 
 # ================= سفارش‌ها =================
@@ -1695,7 +2218,7 @@ async def cancel_order(query, context, oid):
 # ================= لیدربورد / جایزه / کار =================
 async def show_leaderboard(query, context):
     with db() as conn:
-        rows = conn.execute("SELECT username, cash FROM players ORDER BY cash DESC LIMIT 10").fetchall()
+        rows = conn.execute("SELECT username, cash FROM players WHERE approved=1 ORDER BY cash DESC LIMIT 10").fetchall()
     if not rows:
         text = "🏆 هنوز کسی در لیدربورد نیست."
     else:
@@ -1776,6 +2299,8 @@ def do_trade(sender_id, target_id, amount):
             return False, "❌ اول /start بزن."
         if not t:
             return False, "❌ این پلیر هنوز ثبت‌نام نکرده (باید /start بزنه)."
+        if not t["approved"]:
+            return False, "❌ ورود این پلیر هنوز توسط ادمین تأیید نشده."
         if s["cash"] < amount:
             return False, f"❌ پولت کافی نیست!\n💰 داری: {s['cash']:,} $"
         tax = amount * TRADE_TAX_PERCENT // 100
@@ -2135,6 +2660,7 @@ async def additem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ فقط ادمین.")
         return
     context.user_data.clear()
+    context.user_data["flow_chat"] = update.message.chat_id
     context.user_data["step"] = "name"
     await reply_panel(update, ADD_NAME_PROMPT, cancel_markup())
 
@@ -2210,6 +2736,72 @@ async def handle_admin_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step in ("type", "category", "photo"):
             await reply_panel(update, "👆 از دکمه‌های همین مرحله استفاده کن"
                               + (" یا عکس بفرست." if step == "photo" else "."), cancel_markup())
+        elif step == "pamt":
+            ch = parse_change(text)
+            with db() as conn:
+                it = conn.execute("SELECT * FROM items WHERE id=?", (ud.get("p_item"),)).fetchone()
+            if not it or it["is_real"]:
+                ud.clear()
+                await reply_panel(update, "❌ آیتم پیدا نشد.", admin_menu())
+                return
+            new = apply_change(it["buy_price"], ud.get("p_dir"), *ch) if ch else None
+            if new is None:
+                await reply_panel(update, "❌ مقدار نامعتبر.\n" + CHANGE_HINT, cancel_markup())
+                return
+            ud["p_new"] = new
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("۶ ساعت", callback_data="ph_6"), InlineKeyboardButton("۱۲ ساعت", callback_data="ph_12")],
+                [InlineKeyboardButton("۱ روز", callback_data="ph_24"), InlineKeyboardButton("۲ روز", callback_data="ph_48"),
+                 InlineKeyboardButton("۳ روز", callback_data="ph_72")],
+                [InlineKeyboardButton("❌ لغو", callback_data="cancel_flow")]])
+            await reply_panel(update, f"{dir_arrow(new, it['buy_price'])} «{it['name']}»: {it['buy_price']:,}$ ➜ {new:,}$\n"
+                                      f"این قیمت برای چند ساعت باشه؟\n(بعدش خودکار به {it['buy_price']:,}$ برمی‌گرده)", kb)
+        elif step == "mkamt":
+            key = ud.get("mk_key")
+            ch = parse_change(text)
+            with db() as conn:
+                cur = conn.execute("SELECT price FROM market WHERE key=?", (key,)).fetchone()
+            new = apply_change(cur["price"], ud.get("mk_dir"), *ch) if cur and ch else None
+            if new is None:
+                await reply_panel(update, "❌ مقدار نامعتبر.\n" + CHANGE_HINT, cancel_markup())
+                return
+            ud.clear()
+            with db() as conn:
+                old = set_market_price(conn, key, new, int(time.time()))
+            err = await announce_market(context, f"{MARKET_NAMES[key]}: {dir_arrow(new, old)} {old}$ ➜ {new}$",
+                                        "📢 تغییر قیمت خرید سرور")
+            await reply_panel(
+                update,
+                f"✅ قیمت {MARKET_NAMES[key]} از {old}$ به {new}$ تغییر کرد.\n"
+                f"(تا تغییر بعدی همین‌طور می‌مونه.)\n" +
+                ("📣 توی گپ اعلام شد." if not err else f"⚠️ اعلام توی گپ ناموفق بود: {err}"),
+                InlineKeyboardMarkup([[InlineKeyboardButton("📈 بازار", callback_data="mk")]]))
+        elif step == "banreason":
+            uid_t = ud.get("ban_uid")
+            reason = "" if text == "-" else text[:200]
+            ud.clear()
+            if not do_ban(uid_t, reason):
+                await reply_panel(update, "❌ نمی‌شه ادمین رو مسدود کرد.", user_back(uid_t))
+            else:
+                await notify_user(context, uid_t, f"🚫 دسترسی تو به بات مسدود شد.\nدلیل: {reason or 'نامشخص'}")
+                await reply_panel(update, f"🚫 کاربر {uid_t} مسدود شد." + (f"\nدلیل: {reason}" if reason else ""),
+                                  user_back(uid_t))
+        elif step == "usearch":
+            q_ = text.lstrip("@").strip()
+            with db() as conn:
+                if q_.isdigit():
+                    row = conn.execute("SELECT user_id, username FROM players WHERE user_id=?", (int(q_),)).fetchone()
+                    found = (int(q_), row["username"] if row else None)
+                else:
+                    row = conn.execute("SELECT user_id, username FROM players WHERE lower(username)=lower(?)",
+                                       (q_,)).fetchone()
+                    found = (row["user_id"], row["username"]) if row else None
+            if not found:
+                await reply_panel(update, "❌ کاربری پیدا نشد. یوزرنیم یا آیدی عددی بنویس:", cancel_markup())
+                return
+            ud.clear()
+            await reply_panel(update, f"✅ پیدا شد: {found[1] or found[0]}",
+                              InlineKeyboardMarkup([[InlineKeyboardButton("👤 باز کردن پروفایل", callback_data=f"uv_{found[0]}")]]))
         elif step == "bname":
             if not text or len(text) > 40:
                 await reply_panel(update, "❌ اسم باید بین ۱ تا ۴۰ حرف باشه.", cancel_markup())
@@ -2234,7 +2826,7 @@ async def handle_admin_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_panel(update, "❌ یه عدد مثبت بنویس.", cancel_markup())
                 return
             with db() as conn:
-                conn.execute("UPDATE buy_items SET price=? WHERE id=?", (value, ud.get("edit_id")))
+                conn.execute("UPDATE buy_items SET prev_price=price, price=? WHERE id=?", (value, ud.get("edit_id")))
             iid = ud.get("edit_id")
             ud.clear()
             await reply_panel(update, f"✅ قیمت خرید به {value:,}$ تغییر کرد.", InlineKeyboardMarkup(
@@ -2336,9 +2928,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user.id) or not update.message or not update.message.photo:
         return
     ud = context.user_data
+    if ud.get("flow_chat") not in (None, update.message.chat_id):
+        return
     file_id = update.message.photo[-1].file_id
     if ud.get("step") == "photo":
-        await finish_add(context, update.effective_chat.id, user.id, file_id)
+        await finish_add(context, update.message.chat_id, user.id, file_id)
     elif ud.get("edit_step") == "edit_photo":
         item_id = ud.get("edit_id")
         with db() as conn:
@@ -2353,12 +2947,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ud = context.user_data
     uid = update.effective_user.id
-    if ud.get("pstep"):
+    # عملیات نیمه‌تموم فقط توی همون چتی که شروع شده ادامه پیدا می‌کنه (نه توی گروه یا چت دیگه)
+    flow_here = ud.get("flow_chat") in (None, update.message.chat_id)
+    if ud.get("pstep") and flow_here:
         await handle_player_flow(update, context)
         return
     if not is_admin(uid):
         return
-    if ud.get("step") or ud.get("edit_step"):
+    if (ud.get("step") or ud.get("edit_step")) and flow_here:
         await handle_admin_flow(update, context)
     elif update.message.reply_to_message:
         await admin_reply(update, context)
@@ -2431,11 +3027,13 @@ async def show_item_detail(query, context, item_id):
     ]
     if not it["is_real"]:
         if on_sale(it):
-            lines.append(f"🔥 در حراجی — {fmt_duration(it['sale_until'] - time.time())} مونده")
-            rows.append([InlineKeyboardButton("🛑 پایان حراجی", callback_data="fe_" + i)])
-        else:
-            rows.append([InlineKeyboardButton(f"⚡ حراجی {FLASH_DISCOUNT}٪ ({FLASH_HOURS} ساعت)",
-                                              callback_data="fs_" + i)])
+            p, o = eff_price(it), it["buy_price"]
+            lines.append(f"⏱ قیمت موقت: {dir_arrow(p, o)} {p:,}$ (قبلاً {o:,}$) — "
+                         f"{fmt_duration(it['sale_until'] - time.time())} مونده؛ بعدش خودکار برمی‌گرده")
+        rows.append([InlineKeyboardButton("📉 قیمت کمتر (موقت)", callback_data="pd_" + i),
+                     InlineKeyboardButton("📈 قیمت بیشتر (موقت)", callback_data="pu_" + i)])
+        if on_sale(it):
+            rows.append([InlineKeyboardButton("🛑 برگردوندن قیمت اصلی", callback_data="fe_" + i)])
     if not it["is_real"]:
         rows.append([InlineKeyboardButton(
             f"📣 اعلام خرید توی گپ: {'✅ روشن' if it['announce'] else '⬜ خاموش'}", callback_data="an_" + i)])
@@ -2478,35 +3076,83 @@ def find_items(conn, arg):
     return rows
 
 
-def set_flash(item_id):
+def set_temp_price(item_id, new_price, hours):
+    """قیمت موقت: بعد از hours ساعت خودکار به قیمت اصلی برمی‌گرده. خروجی: (وضعیت, آیتم)"""
     with db() as conn:
         it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not it:
             return "no", None
         if it["is_real"]:
             return "real", it
-        if on_sale(it):
-            return "already", it
-        conn.execute("UPDATE items SET sale_until=? WHERE id=?", (int(time.time()) + FLASH_HOURS * 3600, item_id))
+        conn.execute("UPDATE items SET sale_until=?, sale_price=? WHERE id=?",
+                     (int(time.time()) + int(hours) * 3600, int(new_price), item_id))
         it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     return "ok", it
 
 
+def set_flash(item_id):
+    """میان‌بر /flash: ۵۰٪ تخفیف برای ۲۴ ساعت."""
+    with db() as conn:
+        it = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not it:
+        return "no", None
+    if it["is_real"]:
+        return "real", it
+    if on_sale(it):
+        return "already", it
+    return set_temp_price(item_id, max(1, it["buy_price"] * (100 - FLASH_DISCOUNT) // 100), FLASH_HOURS)
+
+
 def end_flash(item_id):
     with db() as conn:
-        conn.execute("UPDATE items SET sale_until=0 WHERE id=?", (item_id,))
+        conn.execute("UPDATE items SET sale_until=0, sale_price=NULL WHERE id=?", (item_id,))
+
+
+def parse_change(text):
+    """'20' یا '20%' => ('pct', 20) | '50$' یا '50 دلار' => ('usd', 50)"""
+    t = normalize_digits(text).replace("٪", "%").replace(" ", "")
+    unit = "pct"
+    if t.endswith("%"):
+        t = t[:-1]
+    elif t.endswith("$"):
+        unit, t = "usd", t[:-1]
+    elif t.endswith("دلار"):
+        unit, t = "usd", t[:-4]
+    if not t.isdigit() or int(t) <= 0:
+        return None
+    return unit, int(t)
+
+
+def apply_change(price, direction, unit, value):
+    """قیمت جدید رو برمی‌گردونه (یا None اگه مقدار نامعتبره)."""
+    if unit == "pct":
+        if (direction == "down" and value > 90) or (direction == "up" and value > 300):
+            return None
+        new = (price * ((100 - value) if direction == "down" else (100 + value)) + 50) // 100
+    else:
+        new = price - value if direction == "down" else price + value
+    return new if new >= 1 and new != price else None
+
+
+CHANGE_HINT = ("مثال: 20 یا 20% (درصد) — یا 50$ (مبلغ دلاری)\n"
+               "حداکثر ۹۰٪ کاهش و ۳۰۰٪ افزایش؛ قیمت باید بیشتر از صفر بمونه.")
 
 
 async def announce_flash(context, it):
-    """پیام Broadcast توی گپ. اگه خطا بود متنش رو برمی‌گردونه."""
-    text = (
-        f"🔥⚡ حراجی ناگهانی! ⚡🔥\n{DIV}\n"
-        f"🔥 حراجی! قیمت {it['name']} برای {FLASH_HOURS} ساعت آینده {FLASH_DISCOUNT}٪ تخفیف خورد!\n\n"
-        f"💵 قیمت قبلی: {it['buy_price']:,}$\n"
-        f"🏷 قیمت جدید: {eff_price(it):,}$\n"
-        f"⏳ فقط {FLASH_HOURS} ساعت فرصت داری!\n\n"
-        f"🛒 برای خرید به فروشگاه ربات برو."
-    )
+    """پیام Broadcast توی گپ برای کم یا زیاد شدن قیمت. اگه خطا بود متنش رو برمی‌گردونه."""
+    old, new = it["buy_price"], eff_price(it)
+    hours = max(1, round((it["sale_until"] - time.time()) / 3600))
+    pct = abs(new - old) * 100 // max(old, 1)
+    if new < old:
+        text = (f"🔥⚡ حراجی! ⚡🔥\n{DIV}\n"
+                f"🔥 قیمت {it['name']} برای {hours} ساعت آینده پایین اومد!\n\n"
+                f"{dir_arrow(new, old)} {old:,}$ ➜ {new:,}$ ({pct}٪ کمتر)\n"
+                f"⏳ فقط {hours} ساعت فرصت داری!\n\n🛒 برای خرید به فروشگاه ربات برو.")
+    else:
+        text = (f"📢 تغییر قیمت\n{DIV}\n"
+                f"📢 قیمت {it['name']} برای {hours} ساعت آینده بالا رفت!\n\n"
+                f"{dir_arrow(new, old)} {old:,}$ ➜ {new:,}$ ({pct}٪ بیشتر)\n"
+                f"⏳ بعد از {hours} ساعت دوباره به قیمت قبلی برمی‌گرده.")
     try:
         if it["photo_id"]:
             await context.bot.send_photo(chat_id=ANNOUNCE_CHAT_ID, photo=it["photo_id"], caption=text[:1024])
@@ -2514,7 +3160,7 @@ async def announce_flash(context, it):
             await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, text=text)
         return None
     except Exception as e:
-        logger.error("Flash announce failed: %s", e)
+        logger.error("Price announce failed: %s", e)
         return str(e)
 
 
@@ -2881,7 +3527,7 @@ async def restore_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= لغو =================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # فقط وقتی واقعاً عملیاتی در جریانه جواب بده
-    if context.user_data:
+    if any(context.user_data.get(k) for k in ("step", "edit_step", "pstep")):
         context.user_data.clear()
         await update.message.reply_text("❌ عملیات لغو شد.")
 
@@ -2913,12 +3559,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # با هر کلیک روی منو، حالت‌های نیمه‌تموم (تیکت، افزودن آیتم، ...) پاک میشن
     # (به‌جز دکمه‌های داخل خودِ مراحل افزودن آیتم)
-    if not data.startswith(("addtype_", "addcat_", "add_skip_photo")):
+    if not data.startswith(("addtype_", "addcat_", "add_skip_photo", "ph_")):
         context.user_data.clear()
+        # هر عملیات فقط توی همون چتی ادامه پیدا می‌کنه که توش شروع شده
+        context.user_data["flow_chat"] = msg.chat_id
 
     # ----- پلیر -----
     if data == "main_menu":
         await show(q, context, main_text(q.from_user), main_menu(admin))
+    elif data == "close_panel":
+        await safe_delete(msg)
     elif data == "cancel_p":
         await show(q, context, main_text(q.from_user), main_menu(admin))
     elif data == "my_assets":
@@ -3139,6 +3789,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rfn_") and num is not None:
         await reject_referral(q, context, num)
 
+    # تأیید / رد کاربر جدید
+    elif data.startswith("nuy_") and num is not None:
+        await approve_user(q, context, num)
+    elif data.startswith("nun_") and num is not None:
+        await reject_user(q, context, num)
+
     # خرید از بازیکن (ادمین)
     elif data == "bm":
         await show_buy_manage(q, context)
@@ -3170,6 +3826,106 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("sr_") and num is not None:
         await reject_sell(q, context, num)
 
+    # قیمت موقت آیتم (کمتر / بیشتر)
+    elif data.startswith(("pd_", "pu_")) and num is not None:
+        down = data.startswith("pd_")
+        with db() as conn:
+            it = conn.execute("SELECT * FROM items WHERE id=?", (num,)).fetchone()
+        if not it or it["is_real"]:
+            await show(q, context, "❌ آیتم پیدا نشد (یا پولیه).", admin_menu())
+        else:
+            context.user_data.update(step="pamt", p_item=num, p_dir="down" if down else "up")
+            await show(q, context,
+                       f"{'📉' if down else '📈'} «{it['name']}» — قیمت اصلی: {it['buy_price']:,}$\n{DIV}\n"
+                       f"چقدر می‌خوای از قیمتش {'کم' if down else 'زیاد'} کنی؟\n{CHANGE_HINT}", cancel_markup())
+    elif data.startswith("ph_") and num in (6, 12, 24, 48, 72):
+        ud_ = context.user_data
+        item_id, new = ud_.get("p_item"), ud_.get("p_new")
+        if not item_id or not new:
+            await show(q, context, "⌛ این مرحله منقضی شده؛ از صفحه آیتم دوباره شروع کن.", admin_menu())
+        else:
+            ud_.clear()
+            ud_["flow_chat"] = msg.chat_id
+            status, it = set_temp_price(item_id, new, num)
+            if status != "ok":
+                await show(q, context, "❌ آیتم پیدا نشد (یا پولیه).", admin_menu())
+            else:
+                err = await announce_flash(context, it)
+                await notify_wishers(context, it)
+                if err:
+                    await context.bot.send_message(
+                        chat_id=msg.chat_id, text=f"⚠️ اعلام توی گپ ناموفق بود:\n{err}\n(بات باید توی گپ عضو باشه)")
+                await show_item_detail(q, context, item_id)
+
+    # بازار طلا و نقره
+    elif data.startswith(("mkd_", "mku_")) and data.split("_", 1)[1] in MARKET_NAMES:
+        key = data.split("_", 1)[1]
+        down = data.startswith("mkd_")
+        with db() as conn:
+            cur = conn.execute("SELECT price FROM market WHERE key=?", (key,)).fetchone()
+        context.user_data.update(step="mkamt", mk_key=key, mk_dir="down" if down else "up")
+        await show(q, context,
+                   f"{'📉' if down else '📈'} {MARKET_NAMES[key]} — قیمت فعلی: {cur['price']}$\n{DIV}\n"
+                   f"چقدر می‌خوای {'کم' if down else 'زیاد'} بشه؟\n{CHANGE_HINT}\n"
+                   f"(این قیمت تا تغییر بعدی خودت ثابت می‌مونه و خودکار برنمی‌گرده.)", cancel_markup())
+    elif data == "mk":
+        await show_market(q, context)
+    elif data == "mkroll":
+        res = roll_market()
+        await show_market(q, context, "✅ قیمت‌های امروز ساخته شد: " + " | ".join(
+            f"{MARKET_NAMES[k]} {o}$ ➜ {n}$" for k, (o, n) in res.items()))
+    elif data == "mkann":
+        err = await announce_market(context)
+        await show_market(q, context, "📣 قیمت‌ها توی گپ اعلام شد." if not err else f"⚠️ ارسال به گپ ناموفق بود: {err}")
+    elif data.startswith("bmk_") and num is not None:
+        with db() as conn:
+            cur = conn.execute("SELECT market FROM buy_items WHERE id=?", (num,)).fetchone()
+            nxt = {None: "gold", "gold": "silver", "silver": None}.get(cur["market"] if cur else None)
+            conn.execute("UPDATE buy_items SET market=? WHERE id=?", (nxt, num))
+        await show_buy_detail(q, context, num)
+    elif data.startswith("bfc_") and num is not None:
+        with db() as conn:
+            conn.execute("UPDATE buy_items SET factor = CASE WHEN factor=100 THEN 50 ELSE 100 END WHERE id=?", (num,))
+        await show_buy_detail(q, context, num)
+
+    # مدیریت کاربران
+    elif data.startswith("ulb_") and num is not None:
+        await show_user_list(q, context, num, banned_only=True)
+    elif data.startswith("ul_") and num is not None:
+        await show_user_list(q, context, num)
+    elif data == "usearch":
+        context.user_data["step"] = "usearch"
+        await show(q, context, "🔎 یوزرنیم (با یا بدون @) یا آیدی عددی کاربر رو بنویس:", cancel_markup())
+    elif data.startswith("uv_") and num is not None:
+        await show_user_profile(q, context, num)
+    elif data.startswith("ub_") and num is not None:
+        context.user_data.update(step="banreason", ban_uid=num)
+        await show(q, context, "🚫 دلیل مسدودیت رو بنویس (یا - بفرست برای بدون دلیل):", cancel_markup())
+    elif data.startswith("uub_") and num is not None:
+        if do_unban(num):
+            await notify_user(context, num, "✅ مسدودیتت برداشته شد. می‌تونی دوباره از بات استفاده کنی.")
+        await show(q, context, f"✅ مسدودیت کاربر {num} برداشته شد.", user_back(num))
+    elif data.startswith("uky_") and num is not None:
+        err = await kick_from_group(context, num)
+        await show(q, context, f"👢 کاربر {num} از گپ کیک شد (می‌تونه دوباره عضو بشه)." if not err else
+                   f"❌ کیک انجام نشد: {err}\n(بات باید توی گپ ادمین با دسترسی بن باشه)", user_back(num))
+    elif data.startswith("uk_") and num is not None:
+        await show(q, context, f"👢 کاربر {num} از گپ اعلامیه‌ها کیک بشه؟\nمی‌تونه دوباره عضو بشه و یه پیام تذکر هم می‌گیره.",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("✅ بله، کیک کن", callback_data=f"uky_{num}"),
+                                          InlineKeyboardButton("❌ نه", callback_data=f"uv_{num}")]]))
+    elif data.startswith("udy_") and num is not None:
+        res = delete_player(num)
+        await show(q, context, "❌ نمی‌شه ادمین رو حذف کرد." if res is None else
+                   f"🗑 کاربر {num} از بات حذف شد (پول، ماشین‌ها، مدال‌ها و عضویت فکشنش پاک شد)."
+                   + ("\n🚫 مسدودیتش (اگه داشت) سر جاشه." if res["existed"] else "\n(توی بات ثبت‌نام نکرده بود.)"),
+                   InlineKeyboardMarkup([[InlineKeyboardButton("👥 کاربران", callback_data="ul_0")]]))
+    elif data.startswith("ud_") and num is not None:
+        await show(q, context, f"⚠️ مطمئنی کاربر {num} کامل از بات حذف بشه؟\n"
+                               f"پول، ماشین‌ها، مدال‌ها، لیست آرزو و عضویت فکشنش پاک میشه و سفارش‌های بازش لغو میشن (بدون برگشت پول).\n"
+                               f"می‌تونه دوباره /start بزنه، مگر اینکه مسدود باشه.",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"udy_{num}"),
+                                          InlineKeyboardButton("❌ نه", callback_data=f"uv_{num}")]]))
+
 
 # ================= خطاها =================
 async def on_error(update, context):
@@ -3191,6 +3947,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # ضد اسپم؛ قبل از همه هندلرها
+    app.add_handler(TypeHandler(Update, access_check), group=-2)   # مسدودی‌ها + تأیید ورود + آخرین فعالیت
     app.add_handler(TypeHandler(Update, rate_limit), group=-1)
 
     app.add_handler(CommandHandler("start", start))
@@ -3207,6 +3964,10 @@ def main():
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("restore", restore_backup))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("kick", kick_command))
+    app.add_handler(CommandHandler("user", user_command))
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("medal", medal_command))
     app.add_handler(CommandHandler("unmedal", unmedal_command))
