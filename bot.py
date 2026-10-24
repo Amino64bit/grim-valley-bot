@@ -752,6 +752,7 @@ def help_text(admin):
             "💎 قیمت‌های خرید، 📈 قیمت بازار (نوسان طلا و نقره) و 👥 کاربران: از پنل مدیریت",
             "/ban @user دلیل | /unban @user | /kick @user | /user @user — مسدودی، رفع مسدودی، کیک از گپ، پروفایل",
             "/announce ماشین یا /اعلام ماشین — روشن/خاموش اعلام خرید یه دسته توی گپ",
+            "/give @user 500 — واریز دستی پول (بدون ریپلای) | /take @user 500 — کسر پول",
             "/sellcap @user 750 — پر کردن سقف فروش روزانه‌ی یه بازیکن (-200 کم، reset صفر، بدون مبلغ = دیدن)",
             "+faction نام / -faction — فکشن",
             "+leader / -leader — لیدر فکشن",
@@ -2101,6 +2102,77 @@ async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ban = is_banned(conn, uid)
         text = asset_text(conn, p) if p else "این کاربر توی بات ثبت‌نام نکرده."
     await update.message.reply_text(f"🆔 {uid}" + (f" | 🚫 مسدود: {ban['reason'] or 'بدون دلیل'}" if ban else "") + f"\n{text}")
+
+
+# ---------- واریز / کسر دستی پول (ادمین) ----------
+def change_cash(uid, amount):
+    """amount مثبت = واریز | منفی = کسر. خروجی: (وضعیت, موجودی جدید یا موجودی فعلی)"""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        p = conn.execute("SELECT cash FROM players WHERE user_id=?", (uid,)).fetchone()
+        if not p:
+            return "no", 0
+        if amount < 0 and p["cash"] < -amount:
+            return "poor", p["cash"]
+        conn.execute("UPDATE players SET cash=cash+? WHERE user_id=?", (amount, uid))
+        return "ok", p["cash"] + amount
+
+
+async def _cash_cmd(update, context, sign):
+    if not is_admin(update.effective_user.id):
+        return
+    cmd = "/give" if sign > 0 else "/take"
+    usage = (f"استفاده:\n{cmd} @یوزرنیم مبلغ\n{cmd} آیدی_عددی مبلغ\n"
+             f"یا روی پیام بازیکن ریپلای کن و فقط {cmd} مبلغ بنویس.\nمثال: {cmd} @ali 500")
+    args = list(context.args or [])
+    reply = update.message.reply_to_message
+    uid = label = None
+    if args and args[0].startswith("@"):
+        with db() as conn:
+            row = conn.execute("SELECT user_id, username FROM players WHERE lower(username)=lower(?)",
+                               (args[0][1:],)).fetchone()
+        if not row:
+            await update.message.reply_text("❌ کاربری با این یوزرنیم توی بات پیدا نشد.")
+            return
+        uid, label, args = row["user_id"], row["username"], args[1:]
+    elif len(args) >= 2 and args[0].isdigit():
+        with db() as conn:
+            row = conn.execute("SELECT user_id, username FROM players WHERE user_id=?", (int(args[0]),)).fetchone()
+        if not row:
+            await update.message.reply_text("❌ کاربری با این آیدی توی بات پیدا نشد.")
+            return
+        uid, label, args = row["user_id"], row["username"] or args[0], args[1:]
+    elif reply and reply.from_user:
+        uid, label = reply.from_user.id, user_label(reply.from_user)
+    else:
+        await update.message.reply_text(usage)
+        return
+    amount = parse_amount(args[0]) if args else None
+    if amount is None or amount <= 0:
+        await update.message.reply_text("❌ یه مبلغ معتبر (عدد مثبت) بنویس.\n" + usage)
+        return
+    status, cash = change_cash(uid, sign * amount)
+    if status == "no":
+        await update.message.reply_text("❌ این کاربر توی بات ثبت‌نام نکرده (باید /start بزنه).")
+        return
+    if status == "poor":
+        await update.message.reply_text(f"❌ اینقدر پول نداره! موجودیش: {cash:,} $")
+        return
+    if sign > 0:
+        await notify_user(context, uid, f"💵 ادمین {amount:,}$ به حسابت واریز کرد.\n💰 موجودی جدید: {cash:,} $")
+        await update.message.reply_text(f"✅ {amount:,} $ به {label} واریز شد.\n💰 موجودی جدید: {cash:,} $")
+    else:
+        await notify_user(context, uid, f"💸 ادمین {amount:,}$ از حسابت کم کرد.\n💰 موجودی جدید: {cash:,} $")
+        await update.message.reply_text(f"✅ {amount:,} $ از {label} کم شد.\n💰 موجودی جدید: {cash:,} $")
+    await refresh_medals(context, uid)
+
+
+async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cash_cmd(update, context, 1)
+
+
+async def take_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cash_cmd(update, context, -1)
 
 
 # ---------- تنظیم دستی سقف فروش روزانه ----------
@@ -4053,6 +4125,8 @@ def main():
     app.add_handler(CommandHandler("kick", kick_command))
     app.add_handler(CommandHandler("user", user_command))
     app.add_handler(CommandHandler("sellcap", sellcap_command))
+    app.add_handler(CommandHandler("give", give_command))
+    app.add_handler(CommandHandler("take", take_command))
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("medal", medal_command))
     app.add_handler(CommandHandler("unmedal", unmedal_command))
