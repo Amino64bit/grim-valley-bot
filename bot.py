@@ -29,12 +29,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ================= تنظیمات =================
 # توکن رو توی محیط (Environment Variable) روی هاستت بذار، نه توی کد
-BOT_TOKEN = "8725147253:AAG2YcCL6AQ7c12kYPzRxAKvhSZwq1taIw4"
-ANNOUNCE_THREAD_ID=4
+BOT_TOKEN = "8725147253:AAE7qBn8BEz0kYoMhcbb0f9ybsqzezos48Y"
 ADMIN_ID = 5591238725
 ADMIN_ID_2 = 6270844351
 # گپی که پیام حراجی‌ها (Flash Sale) توش ارسال میشه
 ANNOUNCE_CHAT_ID = int(os.environ.get("ANNOUNCE_CHAT_ID", "-1003431951834"))
+# شناسه‌ی تاپیک (پناهگاه) توی گپ؛ اگه خالی باشه پیام‌ها توی تاپیک اصلی (General) میرن
+_thread = os.environ.get("ANNOUNCE_THREAD_ID", "4").strip()   # پیش‌فرض: تاپیک شماره ۴ (پناهگاه)
+ANNOUNCE_KW = {"message_thread_id": int(_thread)} if _thread.lstrip("-").isdigit() else {}
 
 DB_FILE = "grim_valley.db"
 MAX_CARS = 3
@@ -1195,9 +1197,9 @@ async def announce_purchase(context, user, item, price, qty=1):
             f"🛒 تو هم از فروشگاه بات خرید کن!")
     try:
         if item["photo_id"]:
-            await context.bot.send_photo(chat_id=ANNOUNCE_CHAT_ID, photo=item["photo_id"], caption=text[:1024])
+            await context.bot.send_photo(chat_id=ANNOUNCE_CHAT_ID, **ANNOUNCE_KW, photo=item["photo_id"], caption=text[:1024])
         else:
-            await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, text=text)
+            await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, **ANNOUNCE_KW, text=text)
     except Exception as e:
         logger.error("Purchase announce failed: %s", e)
 
@@ -1748,7 +1750,7 @@ async def announce_market(context, note=None, title="📈 قیمت امروز خ
     text, _last = market_text(title, note)
     text += "\n\n💎 برای فروش از منوی بات «فروش به سرور» رو بزن."
     try:
-        await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, text=text)
+        await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, **ANNOUNCE_KW, text=text)
         return None
     except Exception as e:
         logger.error("Market announce failed: %s", e)
@@ -3237,9 +3239,9 @@ async def announce_flash(context, it):
                 f"⏳ بعد از {hours} ساعت دوباره به قیمت قبلی برمی‌گرده.")
     try:
         if it["photo_id"]:
-            await context.bot.send_photo(chat_id=ANNOUNCE_CHAT_ID, photo=it["photo_id"], caption=text[:1024])
+            await context.bot.send_photo(chat_id=ANNOUNCE_CHAT_ID, **ANNOUNCE_KW, photo=it["photo_id"], caption=text[:1024])
         else:
-            await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, text=text)
+            await context.bot.send_message(chat_id=ANNOUNCE_CHAT_ID, **ANNOUNCE_KW, text=text)
         return None
     except Exception as e:
         logger.error("Price announce failed: %s", e)
