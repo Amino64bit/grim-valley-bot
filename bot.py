@@ -749,6 +749,7 @@ def help_text(admin):
             "💎 قیمت‌های خرید، 📈 قیمت بازار (نوسان طلا و نقره) و 👥 کاربران: از پنل مدیریت",
             "/ban @user دلیل | /unban @user | /kick @user | /user @user — مسدودی، رفع مسدودی، کیک از گپ، پروفایل",
             "/announce ماشین یا /اعلام ماشین — روشن/خاموش اعلام خرید یه دسته توی گپ",
+            "/sellcap @user 750 — پر کردن سقف فروش روزانه‌ی یه بازیکن (-200 کم، reset صفر، بدون مبلغ = دیدن)",
             "+faction نام / -faction — فکشن",
             "+leader / -leader — لیدر فکشن",
             "🆕 هر کاربر جدید قبل از استفاده از بات باید توسط ادمین تأیید بشه (پیامش برات میاد).",
@@ -1410,6 +1411,9 @@ async def show_referral_detail(query, context, invitee_id):
 
 
 # ================= فروش به سرور (خرید از بازیکن) =================
+MANUAL_SELL = "🛠 تنظیم دستی ادمین"   # ردیف‌های ثبت دستی سقف (پولی بهشون پرداخت نمیشه)
+
+
 SELL_STATUS = {"pending": "⏳ در انتظار", "accepted": "✅ پرداخت شد", "rejected": "❌ رد شد"}
 
 
@@ -1480,7 +1484,7 @@ async def show_sell_menu(query, context):
     with db() as conn:
         items = conn.execute("SELECT * FROM buy_items ORDER BY id").fetchall()
         credited, pending, oldest = sell_window(conn, uid)
-        last = conn.execute("SELECT * FROM sell_orders WHERE user_id=? ORDER BY id DESC LIMIT 3", (uid,)).fetchall()
+        last = conn.execute("SELECT * FROM sell_orders WHERE user_id=? AND item_name!=? ORDER BY id DESC LIMIT 3", (uid, MANUAL_SELL)).fetchall()
     if not items:
         await show(query, context, f"💎 فروش به سرور\n{DIV}\nفعلاً سرور چیزی نمی‌خره.", back_main())
         return
@@ -1943,8 +1947,8 @@ async def show_user_profile(query, context, uid):
         if p:
             stats["orders"] = conn.execute("SELECT COUNT(*), SUM(status='pending') FROM orders WHERE user_id=?", (uid,)).fetchone()
             stats["tickets"] = conn.execute("SELECT COUNT(*) FROM tickets WHERE user_id=?", (uid,)).fetchone()[0]
-            stats["sold"] = conn.execute("SELECT COALESCE(SUM(total),0) FROM sell_orders WHERE user_id=? AND status='accepted'",
-                                         (uid,)).fetchone()[0]
+            stats["sold"] = conn.execute("SELECT COALESCE(SUM(total),0) FROM sell_orders WHERE user_id=? AND status='accepted' "
+                                         "AND item_name!=?", (uid, MANUAL_SELL)).fetchone()[0]
             stats["fac"] = faction_of(conn, uid)
     info = await tg_profile(context, uid)
     lines = ["👤 پروفایل کاربر", DIV, f"🆔 {uid}"]
@@ -2094,6 +2098,83 @@ async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ban = is_banned(conn, uid)
         text = asset_text(conn, p) if p else "این کاربر توی بات ثبت‌نام نکرده."
     await update.message.reply_text(f"🆔 {uid}" + (f" | 🚫 مسدود: {ban['reason'] or 'بدون دلیل'}" if ban else "") + f"\n{text}")
+
+
+# ---------- تنظیم دستی سقف فروش روزانه ----------
+def adjust_sell_usage(uid, amount):
+    """amount مثبت = پر کردن سقف | منفی = کم کردن | None = صفر کردن. خروجی: (credited, pending, delta) یا None."""
+    now = int(time.time())
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM players WHERE user_id=?", (uid,)).fetchone():
+            return None
+        credited, pending, _old = sell_window(conn, uid)
+        delta = -credited if amount is None else max(amount, -credited)
+        if delta:
+            conn.execute(
+                "INSERT INTO sell_orders (user_id, username, item_name, qty, unit_price, total, status, created, done_at)"
+                " VALUES (?,?,?,1,?,?, 'accepted', ?, ?)", (uid, None, MANUAL_SELL, delta, delta, now, now))
+        credited, pending, _old = sell_window(conn, uid)
+    return credited, pending, delta
+
+
+async def sellcap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sellcap @user [مبلغ | -مبلغ | reset] — دیدن یا تنظیم سقف فروش ۲۴ ساعته‌ی یه بازیکن."""
+    if not is_admin(update.effective_user.id):
+        return
+    args = list(context.args or [])
+    usage = ("📊 استفاده:\n/sellcap @user — دیدن وضعیت\n/sellcap @user 750 — اضافه کردن به مصرف سقف\n"
+             "/sellcap @user -200 — کم کردن\n/sellcap @user reset — صفر کردن\n"
+             "(به‌جای @user می‌تونی روی پیامش ریپلای کنی و فقط مبلغ بنویسی)")
+    reply = update.message.reply_to_message
+    uid = label = None
+    if args and args[0].startswith("@"):
+        with db() as conn:
+            row = conn.execute("SELECT user_id, username FROM players WHERE lower(username)=lower(?)",
+                               (args[0][1:],)).fetchone()
+        if not row:
+            await update.message.reply_text("❌ کاربری با این یوزرنیم توی بات پیدا نشد.")
+            return
+        uid, label, args = row["user_id"], row["username"], args[1:]
+    elif reply and reply.from_user:
+        uid, label = reply.from_user.id, user_label(reply.from_user)
+    else:
+        await update.message.reply_text(usage)
+        return
+
+    amount, mode = 0, "view"
+    if args:
+        if args[0].lower() in ("reset", "صفر"):
+            amount, mode = None, "set"
+        else:
+            raw = normalize_digits(args[0]).replace(",", "")
+            sign = -1 if raw.startswith("-") else 1
+            val = parse_amount(raw.lstrip("+-"))
+            if val is None or val <= 0:
+                await update.message.reply_text("❌ مبلغ نامعتبر.\n" + usage)
+                return
+            amount, mode = sign * val, "set"
+
+    if mode == "view":
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM players WHERE user_id=?", (uid,)).fetchone():
+                await update.message.reply_text("❌ این کاربر توی بات ثبت‌نام نکرده.")
+                return
+            credited, pending, oldest = sell_window(conn, uid)
+        delta = 0
+    else:
+        res = adjust_sell_usage(uid, amount)
+        if res is None:
+            await update.message.reply_text("❌ این کاربر توی بات ثبت‌نام نکرده.")
+            return
+        credited, pending, delta = res
+    remaining = max(0, SELL_DAILY_CAP - credited - pending)
+    head = ("📊 سقف فروش " + str(label)) if mode == "view" else (
+        f"✅ سقف فروش {label} تنظیم شد ({delta:+,}$)." if delta else f"⚠️ تغییری ایجاد نشد ({label}).")
+    await update.message.reply_text(
+        f"{head}\n{DIV}\n📥 مصرف‌شده (۲۴ ساعت اخیر): {credited:,}$ از {SELL_DAILY_CAP:,}$\n"
+        f"⏳ در انتظار: {pending:,}$\n💵 باقی‌مانده: {remaining:,}$\n"
+        f"(این تغییر پولی به بازیکن نمیده و بعد از ۲۴ ساعت خودکار از سقف حذف میشه.)")
 
 
 # ================= سفارش‌ها =================
@@ -3968,6 +4049,7 @@ def main():
     app.add_handler(CommandHandler("unban", unban_command))
     app.add_handler(CommandHandler("kick", kick_command))
     app.add_handler(CommandHandler("user", user_command))
+    app.add_handler(CommandHandler("sellcap", sellcap_command))
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("medal", medal_command))
     app.add_handler(CommandHandler("unmedal", unmedal_command))
